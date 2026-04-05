@@ -11,6 +11,7 @@
 - Phase: <N> — <name>
 - Worktree: .worktrees/phase-<N>-<slug>
 - Branch: phase/<N>-<slug>
+- Tags: <comma-separated tags, e.g. "backend.api, infra">
 
 ## Dependencies
 - <TASK-YYY or "None">

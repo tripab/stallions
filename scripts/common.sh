@@ -138,6 +138,95 @@ find_actionable_task() {
   done
 }
 
+# Detect whether the Task Index has a Tags column (v3) or not (v2).
+# Returns the column index for Tags (7 in v3), or 0 if absent.
+_tags_column() {
+  [ -f "$AGENT_LOG" ] || echo 0
+  awk -F'|' '
+    /^\| *ID *\|/ {
+      # Count non-empty pipe-separated fields in the header row
+      print NF - 1
+      exit
+    }
+  ' "$AGENT_LOG"
+}
+
+# Find first task matching a status pattern AND matching the given role tags.
+# Handles hierarchical prefix matching and the "*" wildcard.
+# Also respects deps_met().
+#
+# Usage: find_tagged_task "Pending|Reviewed" "backend"
+#        find_tagged_task "In Review" "*"
+#
+# Returns the first matching task ID, or empty string.
+find_tagged_task() {
+  local status_pattern="$1"
+  local role_tags="$2"   # comma-separated role tags, or "*"
+
+  [ -f "$AGENT_LOG" ] || return
+
+  # Detect number of columns so we know where Tags lives
+  local ncols
+  ncols=$(_tags_column)
+
+  # Tags column is only present when ncols >= 6 (v3 schema: ID Title Phase Status DepsOn Tags)
+  local tags_col=0
+  [ "$ncols" -ge 6 ] && tags_col=7
+
+  local candidates
+  candidates=$(find_all_tasks "$status_pattern")
+
+  for task_id in $candidates; do
+    # Dependency check first (cheap)
+    deps_met "$task_id" || continue
+
+    # If no Tags column or role_tags is wildcard, any task qualifies
+    if [ "$tags_col" -eq 0 ] || [ "$role_tags" = "*" ]; then
+      echo "$task_id"
+      return
+    fi
+
+    # Read the task's Tags field from AGENT_LOG
+    local task_tags
+    task_tags=$(awk -F'|' -v id="$task_id" -v col="$tags_col" '
+      /^\|[- ]+\|/ { next }
+      {
+        gsub(/^[ \t]+|[ \t]+$/, "", $2)
+        if ($2 == id) {
+          gsub(/^[ \t]+|[ \t]+$/, "", $col)
+          print $col
+          exit
+        }
+      }
+    ' "$AGENT_LOG")
+
+    # A task with no tags can be claimed by any agent (v2 compat)
+    if [ -z "$task_tags" ] || [ "$task_tags" = "—" ] || [ "$task_tags" = "-" ]; then
+      echo "$task_id"
+      return
+    fi
+
+    # Check each role tag against each task tag using prefix matching
+    local IFS_SAVE="$IFS"
+    IFS=','
+    local role_tag
+    for role_tag in $role_tags; do
+      role_tag="${role_tag// /}"   # strip spaces
+      [ -z "$role_tag" ] && continue
+      local task_tag
+      for task_tag in $task_tags; do
+        task_tag="${task_tag// /}"
+        [ -z "$task_tag" ] && continue
+        # Prefix match: task_tag starts with role_tag
+        case "$task_tag" in
+          "${role_tag}"*) IFS="$IFS_SAVE"; echo "$task_id"; return ;;
+        esac
+      done
+    done
+    IFS="$IFS_SAVE"
+  done
+}
+
 # Check for pending design questions across all task files.
 # Returns the task ID that has a pending question, or empty.
 find_pending_question() {

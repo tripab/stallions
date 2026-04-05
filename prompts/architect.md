@@ -32,17 +32,20 @@ Present the plan. Ask about: feature priorities (effort vs. criticality), securi
    ```
    Add `.worktrees/` to .gitignore on the main branch.
 
-3. Create `AGENT_LOG.md` using the schema in `schemas/AGENT_LOG_SCHEMA.md`:
-   - One row per task: ID, Title, Phase, Status, Depends On
+3. **Discover agent roles (if `orchestration.toml` exists):** Read the file to find all defined roles and their `tags` arrays. Use these tags when assigning task tags in the next steps. If `orchestration.toml` is absent, use sensible defaults: `backend`, `frontend`, `infra`, `test`.
+
+4. Create `AGENT_LOG.md` using the schema in `schemas/AGENT_LOG_SCHEMA.md`:
+   - One row per task: ID, Title, Phase, Status, Depends On, Tags
+   - Tags: assign one or more comma-separated tags to every task. Use dot-separated hierarchy matching the role tag prefixes (e.g. `backend.api`, `frontend.ui`, `infra.ci`, `test.e2e`). Tasks with cross-cutting concerns can have multiple tags (e.g. `backend, infra`).
    - Phases & Worktrees table mapping phase → worktree → branch
    - Empty Activity Log section
 
-4. Create `tasks/` directory. For each task, create `tasks/TASK-XXX.md` using the schema in `schemas/TASK_SCHEMA.md`:
+5. Create `tasks/` directory. For each task, create `tasks/TASK-XXX.md` using the schema in `schemas/TASK_SCHEMA.md`:
    - Description, Acceptance Criteria (checkboxes)
-   - Phase, Worktree path, Branch, Dependencies
+   - Phase, Worktree path, Branch, Tags (matching the AGENT_LOG row), Dependencies
    - Empty sections: Implementer Notes, Test Results, Design Q&A, Review Comments
 
-5. Tasks should be granular (1–2 hours each), ordered so dependencies resolve within the same or earlier phase.
+6. Tasks should be granular (1–2 hours each), ordered so dependencies resolve within the same or earlier phase.
 
 After writing all files, inform the user that the Implementer and Reviewer agents can now be launched.
 

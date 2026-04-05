@@ -1,0 +1,119 @@
+# orchestration.toml — Stallions v3 project configuration
+#
+# Copy this file into your project root and customise for your stack.
+# Run `./scripts/setup.sh` after editing.
+#
+# TOML parsing requires: pip install yq  (provides the `tomlq` command)
+# Without tomlq, place equivalent settings in .env.orchestration instead.
+
+# ── Project ──────────────────────────────────────────────────────────────────
+
+[project]
+name        = "my-project"
+log_file    = "AGENT_LOG.md"
+tasks_dir   = "tasks"
+
+# ── Defaults (inherited by all roles unless overridden) ──────────────────────
+
+[defaults]
+provider  = "providers/claude.sh"
+model     = "sonnet"
+max_turns = 25
+
+# ── Supervisor ───────────────────────────────────────────────────────────────
+
+[supervisor]
+heartbeat_interval = 30    # seconds between health checks
+max_restart_count  = 3     # per-agent consecutive failures before giving up
+restart_backoff    = 60    # seconds to wait between restarts
+notify             = true
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+[logging]
+level                  = "standard"   # "minimal" | "standard" | "verbose"
+capture_responses      = true
+response_retention_days = 7
+max_response_size_kb   = 500
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+[notifications]
+enabled = false   # set to true after configuring Slack below
+
+[notifications.slack]
+bot_token_env   = "SLACK_BOT_TOKEN"   # export this env var — never commit the token
+default_channel = ""                  # fallback channel ID (e.g. "C0GENERAL123")
+username        = "Orchestrator"
+icon_emoji      = ":robot_face:"
+thread_per_task = true                # group per-task events in Slack threads
+
+# Map each event type to a channel ID.
+# Leave empty to use default_channel for all events.
+[notifications.slack.channels]
+task_in_review    = ""   # #dev-progress
+review_submitted  = ""
+review_approved   = ""
+task_committed    = ""
+phase_merge_needed = ""  # #ops-alerts
+phase_merged      = ""
+agent_failed      = ""   # #ops-alerts
+all_tasks_done    = ""
+
+# ── Agent Role Definitions ────────────────────────────────────────────────────
+# Each role defines: type, prompt, tags, provider override, instances, etc.
+# type options: "implementer" | "reviewer" | "qa_responder" | "interactive"
+
+[roles.architect]
+type = "interactive"   # launched manually or via dashboard; not spawned by supervisor
+
+[roles.implementer]
+type        = "implementer"
+prompt      = "prompts/implementer.md"
+tags        = []               # empty = claims any untagged task (generic fallback)
+instances   = 1
+task_filter = "Pending|Reviewed"
+
+[roles.backend]
+type        = "implementer"
+prompt      = "prompts/backend.md"
+tags        = ["backend", "backend.api", "backend.db", "backend.auth"]
+instances   = 1
+task_filter = "Pending|Reviewed"
+# hooks_dir = "hooks/backend"  # uncomment to enable pre/post invoke hooks
+
+[roles.frontend]
+type        = "implementer"
+prompt      = "prompts/frontend.md"
+tags        = ["frontend", "frontend.ui", "frontend.components"]
+instances   = 1
+task_filter = "Pending|Reviewed"
+# hooks_dir = "hooks/frontend"
+
+[roles.tester]
+type        = "implementer"
+prompt      = "prompts/tester.md"
+tags        = ["test", "test.unit", "test.e2e", "test.integration"]
+instances   = 1
+task_filter = "Pending|Reviewed"
+
+[roles.devops]
+type        = "implementer"
+prompt      = "prompts/devops.md"
+tags        = ["infra", "infra.ci", "infra.docker", "infra.terraform"]
+instances   = 1
+task_filter = "Pending|Reviewed"
+
+[roles.reviewer]
+type        = "reviewer"
+prompt      = "prompts/reviewer.md"
+tags        = ["*"]            # reviews all task types
+effort      = "high"
+instances   = 1
+task_filter = "In Review"
+
+[roles.qa]
+type          = "qa_responder"
+prompt        = "prompts/qa.md"
+poll_interval = 120
+instances     = 1

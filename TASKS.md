@@ -180,16 +180,16 @@ Write the QA/design-question-answering prompt, consolidating the inline prompt f
 | P1-T3 | Implement `find_tagged_task()` in common.sh | 1 | Done |
 | P1-T4 | Dynamic column detection for v2 backwards compatibility | 1 | Done |
 | P1-T5 | Update architect.md with tag assignment instructions | 1 | Done |
-| P2-T1 | TOML config parsing in common.sh | 2 | Not Started |
-| P2-T2 | Create orchestration.toml template | 2 | Not Started |
-| P2-T3 | Extract lifecycle functions into common.sh | 2 | Not Started |
-| P2-T4 | Create run_agent.sh — generic role-based runner | 2 | Not Started |
-| P2-T5 | Hook execution support in run_agent.sh | 2 | Not Started |
-| P2-T6 | Convert existing runner scripts to v2 compatibility shims | 2 | Not Started |
-| P2-T7 | JSONL log writing in run_agent.sh | 2 | Not Started |
-| P2-T8 | Implement `parse_tokens()` in common.sh | 2 | Not Started |
-| P2-T9 | Response capture via tee | 2 | Not Started |
-| P2-T10 | Log directory setup in setup.sh | 2 | Not Started |
+| P2-T1 | TOML config parsing in common.sh | 2 | Done |
+| P2-T2 | Create orchestration.toml template | 2 | Done |
+| P2-T3 | Extract lifecycle functions into common.sh | 2 | Done |
+| P2-T4 | Create run_agent.sh — generic role-based runner | 2 | Done |
+| P2-T5 | Hook execution support in run_agent.sh | 2 | Done |
+| P2-T6 | Convert existing runner scripts to v2 compatibility shims | 2 | Done |
+| P2-T7 | JSONL log writing in run_agent.sh | 2 | Done |
+| P2-T8 | Implement `parse_tokens()` in common.sh | 2 | Done |
+| P2-T9 | Response capture via tee | 2 | Done |
+| P2-T10 | Log directory setup in setup.sh | 2 | Done |
 | P3-T1 | Create supervisor.sh — spawn logic | 3 | Not Started |
 | P3-T2 | Heartbeat monitoring and re-spawn in supervisor.sh | 3 | Not Started |
 | P3-T3 | Graceful shutdown in supervisor.sh | 3 | Not Started |

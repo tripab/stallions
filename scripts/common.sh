@@ -15,6 +15,78 @@ PROVIDERS_DIR="$PROJECT_ROOT/providers"
 
 mkdir -p "$SIGNAL_DIR"
 
+# ── Config loading (orchestration.toml or .env fallback) ────────────────────
+
+ORCHESTRATION_TOML="${PROJECT_ROOT}/orchestration.toml"
+LOG_LEVEL="${LOG_LEVEL:-standard}"          # minimal | standard | verbose
+CAPTURE_RESPONSES="${CAPTURE_RESPONSES:-true}"
+
+# Load project config from orchestration.toml (via tomlq) or .env fallback.
+# Safe to call when no config file exists — just keeps the built-in defaults.
+load_config() {
+  if [ -f "$ORCHESTRATION_TOML" ] && command -v tomlq &>/dev/null; then
+    _load_toml_config
+  elif [ -f "$PROJECT_ROOT/.env.orchestration" ]; then
+    # shellcheck disable=SC1090
+    source "$PROJECT_ROOT/.env.orchestration"
+  fi
+}
+
+_load_toml_config() {
+  local t="$ORCHESTRATION_TOML" v
+
+  v=$(tomlq -r '.project.log_file // empty' "$t" 2>/dev/null)
+  [ -n "$v" ] && AGENT_LOG="$PROJECT_ROOT/$v"
+
+  v=$(tomlq -r '.project.tasks_dir // empty' "$t" 2>/dev/null)
+  [ -n "$v" ] && TASKS_DIR="$PROJECT_ROOT/$v"
+
+  v=$(tomlq -r '.defaults.model // empty' "$t" 2>/dev/null)
+  [ -n "$v" ] && AGENT_MODEL="$v"
+
+  v=$(tomlq -r '.defaults.max_turns // empty' "$t" 2>/dev/null)
+  [ -n "$v" ] && MAX_TURNS="$v"
+
+  v=$(tomlq -r '.logging.level // empty' "$t" 2>/dev/null)
+  [ -n "$v" ] && LOG_LEVEL="$v"
+
+  v=$(tomlq -r '.logging.capture_responses // empty' "$t" 2>/dev/null)
+  [ -n "$v" ] && CAPTURE_RESPONSES="$v"
+}
+
+# Get a config value for a role, falling back to [defaults].
+# For array fields (tags), returns a comma-separated string.
+# Usage: role_config_get <role_name> <field>
+role_config_get() {
+  local role_lc="$1"
+  local field="$2"
+
+  if [ -f "$ORCHESTRATION_TOML" ] && command -v tomlq &>/dev/null; then
+    local v
+    if [ "$field" = "tags" ]; then
+      v=$(tomlq -r ".roles.${role_lc}.tags // [] | join(\",\")" "$ORCHESTRATION_TOML" 2>/dev/null)
+    else
+      v=$(tomlq -r ".roles.${role_lc}.${field} // empty" "$ORCHESTRATION_TOML" 2>/dev/null)
+      # Fall back to [defaults] for scalar fields
+      if [ -z "$v" ]; then
+        v=$(tomlq -r ".defaults.${field} // empty" "$ORCHESTRATION_TOML" 2>/dev/null)
+      fi
+    fi
+    [ -n "$v" ] && echo "$v" && return
+  fi
+
+  # Env var fallback: ROLE_BACKEND_PROMPT, ROLE_REVIEWER_MODEL, etc.
+  local role_uc field_uc env_var default_var
+  role_uc=$(echo "$role_lc" | tr '[:lower:]' '[:upper:]')
+  field_uc=$(echo "$field"   | tr '[:lower:]' '[:upper:]')
+  env_var="ROLE_${role_uc}_${field_uc}"
+  eval "local v=\${${env_var}:-}"
+  [ -n "$v" ] && echo "$v" && return
+
+  default_var="DEFAULT_${field_uc}"
+  eval "echo \"\${${default_var}:-}\""
+}
+
 # Parse --provider <file> from script arguments.
 # Call this from runner scripts: parse_provider_arg "$@"
 parse_provider_arg() {
@@ -571,6 +643,7 @@ load_provider() {
     exit 1
   fi
   _PROVIDER_LOADED=true
+  AGENT_PROVIDER="$provider_file"   # record for JSONL logging
   log_info "Loaded provider: $provider_file"
 }
 
@@ -597,6 +670,553 @@ require_file() {
     log_err "Required file not found: $1"
     exit 1
   fi
+}
+
+# ── Heartbeat ───────────────────────────────────────────────────────────────
+
+# Write a heartbeat file so the supervisor knows this agent is alive.
+# Called once per main loop iteration.
+_write_heartbeat() {
+  local role="${AGENT_ROLE:-agent}"
+  local instance="${AGENT_INSTANCE:-0}"
+  mkdir -p "$SIGNAL_DIR/heartbeats"
+  date -u +%s > "$SIGNAL_DIR/heartbeats/${role}_${instance}.heartbeat"
+}
+
+# ── Hook execution ───────────────────────────────────────────────────────────
+
+# Run a lifecycle hook script if it exists.
+# Usage: run_hooks <phase> <task_id> <worktree>
+# Returns non-zero if the hook script fails.
+run_hooks() {
+  local hook_phase="$1"
+  local task_id="${2:-}"
+  local worktree="${3:-}"
+  local hooks_dir="${AGENT_HOOKS_DIR:-}"
+  [ -z "$hooks_dir" ] && return 0
+  local hook_script="$hooks_dir/${hook_phase}.sh"
+  [ -f "$hook_script" ] || return 0
+  log_info "Running hook: $hook_script"
+  bash "$hook_script" "$task_id" "$worktree"
+}
+
+# ── Token parsing ────────────────────────────────────────────────────────────
+
+# Parse token counts from agent output. Returns a JSON object or "null".
+# Usage: parse_tokens <output_file>
+parse_tokens() {
+  local output_file="$1"
+  [ -f "$output_file" ] || { echo "null"; return; }
+
+  # Claude Code format: "42,300 input · 12,800 output · 8,200 cache read · 3,100 cache write"
+  # Also handles: "42300 input, 12800 output (8200 cache read, 3100 cache write)"
+  local input=0 output=0 cache_read=0 cache_write=0 found=false
+
+  # Try to find a token summary line near the end of output
+  local token_line
+  token_line=$(grep -iE '(input|output).*(token|tok)|(token|tok).*(input|output)|tokens:' \
+    "$output_file" 2>/dev/null | tail -3)
+
+  if [ -z "$token_line" ]; then
+    # Also check last 20 lines (summary may be there without "token" keyword)
+    token_line=$(tail -20 "$output_file" | grep -iE '[0-9,]+ input|input[: ]+[0-9,]+')
+  fi
+
+  if [ -n "$token_line" ]; then
+    # Extract numbers associated with each field
+    local raw
+    raw=$(echo "$token_line" | tr ',' ' ' | tr -d "'")
+
+    input=$(echo "$raw"      | grep -oE '[0-9]+ input'      | grep -oE '[0-9]+' | head -1)
+    output=$(echo "$raw"     | grep -oE '[0-9]+ output'     | grep -oE '[0-9]+' | head -1)
+    cache_read=$(echo "$raw" | grep -oiE '[0-9]+ cache.?read'  | grep -oE '^[0-9]+' | head -1)
+    cache_write=$(echo "$raw"| grep -oiE '[0-9]+ cache.?write' | grep -oE '^[0-9]+' | head -1)
+
+    [ -n "$input" ] && found=true
+  fi
+
+  if [ "$found" = true ]; then
+    echo "{\"input\":${input:-0},\"output\":${output:-0},\"cache_read\":${cache_read:-0},\"cache_write\":${cache_write:-0}}"
+  else
+    echo "null"
+  fi
+}
+
+# ── Logged agent invocation ──────────────────────────────────────────────────
+
+# Invoke the coding agent and write a versioned JSONL log entry.
+#
+# Usage:
+#   invoke_agent_logged <prompt_file> [task_id] [mode]
+#   EXIT_CODE=$?
+#
+# Reads:  AGENT_ROLE, AGENT_INSTANCE, AGENT_PROVIDER, AGENT_MODEL,
+#         LOG_LEVEL, CAPTURE_RESPONSES
+# Sets:   LAST_INVOCATION_ID, LAST_RESPONSE_FILE
+invoke_agent_logged() {
+  local prompt_file="$1"
+  local task_id="${2:-}"
+  local mode="${3:-fresh}"
+
+  local role="${AGENT_ROLE:-implementer}"
+  local instance="${AGENT_INSTANCE:-0}"
+  local inv_id="inv_$(date -u '+%Y%m%d_%H%M%S')_${role}_${instance}"
+  LAST_INVOCATION_ID="$inv_id"
+  LAST_RESPONSE_FILE=""
+
+  local start_ts
+  start_ts=$(date -u +%s)
+
+  # Prompt metadata
+  local prompt_bytes prompt_hash
+  prompt_bytes=$(wc -c < "$prompt_file" | tr -d ' ')
+  prompt_hash="sha256:$(shasum -a 256 "$prompt_file" 2>/dev/null | awk '{print $1}' || echo "unknown")"
+
+  # Response capture
+  local response_tmp exit_code=0
+  response_tmp=$(mktemp)
+
+  if [ "$LOG_LEVEL" = "minimal" ]; then
+    invoke_coding_agent < "$prompt_file" || exit_code=$?
+  else
+    # Temporarily disable pipefail so we can capture PIPESTATUS
+    set +eo pipefail
+    invoke_coding_agent < "$prompt_file" | tee "$response_tmp"
+    exit_code=${PIPESTATUS[0]}
+    set -eo pipefail
+  fi
+
+  local end_ts duration_seconds
+  end_ts=$(date -u +%s)
+  duration_seconds=$(( end_ts - start_ts ))
+
+  # Parse tokens from response
+  local tokens_json="null"
+  [ "$LOG_LEVEL" != "minimal" ] && tokens_json=$(parse_tokens "$response_tmp")
+
+  # Response summary + optional full capture
+  local response_summary="" response_file=""
+  if [ "$LOG_LEVEL" != "minimal" ] && [ -s "$response_tmp" ]; then
+    response_summary=$(head -c 200 "$response_tmp" | tr '\n' ' ' | sed 's/"/'"'"'/g')
+    if [ "$CAPTURE_RESPONSES" = "true" ]; then
+      mkdir -p "$PROJECT_ROOT/logs/responses"
+      response_file="logs/responses/${inv_id}.txt"
+      cp "$response_tmp" "$PROJECT_ROOT/$response_file"
+      LAST_RESPONSE_FILE="$response_file"
+    fi
+  fi
+  rm -f "$response_tmp"
+
+  # Context for log entry
+  local phase="" worktree="" outcome=""
+  if [ -n "$task_id" ]; then
+    phase=$(task_phase "$task_id" 2>/dev/null || echo "")
+    worktree=$(task_worktree_path "$task_id" 2>/dev/null || echo "")
+    outcome=$(task_status "$task_id" 2>/dev/null || echo "")
+  fi
+
+  # Write JSONL entry (one line, double-quotes escaped)
+  local entry
+  entry="{\"v\":1,\"id\":\"${inv_id}\",\"timestamp\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"role\":\"${role}\",\"instance\":${instance},\"task_id\":\"${task_id}\",\"mode\":\"${mode}\",\"provider\":\"${AGENT_PROVIDER:-providers/claude.sh}\",\"model\":\"${AGENT_MODEL:-sonnet}\",\"phase\":\"${phase}\",\"worktree\":\"${worktree}\",\"duration_seconds\":${duration_seconds},\"exit_code\":${exit_code},\"outcome\":\"${outcome}\",\"tokens\":${tokens_json},\"prompt_hash\":\"${prompt_hash}\",\"prompt_bytes\":${prompt_bytes},\"response_summary\":\"${response_summary}\",\"response_file\":\"${response_file}\",\"errors\":[]}"
+
+  mkdir -p "$PROJECT_ROOT/logs/agents"
+  echo "$entry" >> "$PROJECT_ROOT/logs/orchestrator.jsonl"
+  echo "$entry" >> "$PROJECT_ROOT/logs/agents/${role}_${instance}.jsonl"
+
+  return $exit_code
+}
+
+# ── Lifecycle functions ──────────────────────────────────────────────────────
+# These contain the main loop bodies for each agent type. They are called by
+# run_agent.sh after role config has been resolved and exported as env vars.
+#
+# Required env vars (set by run_agent.sh):
+#   AGENT_ROLE, AGENT_INSTANCE, AGENT_PROMPT_FILE, AGENT_ROLE_TAGS,
+#   AGENT_HOOKS_DIR, AGENT_LOOP_MODE, POLL_INTERVAL
+
+# lifecycle_implementer — picks tasks, invokes agent, commits approved work
+lifecycle_implementer() {
+  local role="${AGENT_ROLE:-implementer}"
+  local prompt_file="${AGENT_PROMPT_FILE:-$PROMPTS_DIR/implementer.md}"
+
+  require_file "$prompt_file"
+  require_file "$AGENT_LOG"
+
+  log_info "${role} agent starting (instance ${AGENT_INSTANCE:-0})..."
+
+  while true; do
+    _write_heartbeat
+
+    local TOTAL DONE
+    TOTAL=$(total_tasks)
+    DONE=$(count_tasks "Done")
+    log_info "Progress: $DONE/$TOTAL tasks done"
+
+    # All done — merge phases and exit
+    if [[ "$DONE" -eq "$TOTAL" && "$TOTAL" -gt 0 ]]; then
+      log_ok "All $TOTAL tasks complete."
+      log_info "Merging all phase branches into main..."
+      if merge_all_phases; then
+        notify "${role}" "All $TOTAL tasks done. All phases merged into main." "success"
+      else
+        notify "${role}" "All tasks done but final merge needs manual resolution." "error"
+      fi
+      log_ok "${role} shutting down."
+      exit 0
+    fi
+
+    # Priority 1: commit Approved tasks (zero tokens, crash recovery)
+    local TASK_ID
+    TASK_ID=$(find_task "Approved")
+    if [ -n "$TASK_ID" ]; then
+      local TITLE WORKTREE TASK_PHASE
+      TITLE=$(task_title "$TASK_ID")
+      WORKTREE=$(task_worktree_path "$TASK_ID")
+
+      if [ -z "$WORKTREE" ] || [ ! -d "$PROJECT_ROOT/$WORKTREE" ]; then
+        log_err "$TASK_ID approved but worktree not found at $WORKTREE. Skipping."
+        sleep 10
+        continue
+      fi
+
+      log_info "$TASK_ID is Approved — committing in bash (zero tokens)..."
+
+      TASK_PHASE=$(task_phase "$TASK_ID")
+      if [ -n "$TASK_PHASE" ] && [ "$TASK_PHASE" -gt 1 ]; then
+        if ! ensure_phases_merged "$TASK_PHASE"; then
+          log_err "Phase merge failed for phase $TASK_PHASE. Resolve conflicts and retry."
+          notify "${role}" "Phase merge conflict on phase $TASK_PHASE" "error"
+          sleep 30
+          continue
+        fi
+      fi
+
+      cd "$PROJECT_ROOT/$WORKTREE"
+      git add -A
+      if git diff --cached --quiet 2>/dev/null; then
+        log_info "$TASK_ID has no uncommitted changes (may have been committed already)."
+      else
+        git commit -m "feat($TASK_ID): $TITLE"
+        log_ok "$TASK_ID committed."
+      fi
+      cd "$PROJECT_ROOT"
+
+      update_task_status "$TASK_ID" "Done"
+      append_activity_log "${role}" "$TASK_ID committed and Done (crash recovery)"
+      log_ok "$TASK_ID → Done (zero tokens)"
+      notify "${role}" "$TASK_ID committed (crash recovery)" "success"
+      sleep 2
+      continue
+    fi
+
+    # Priority 2: address reviewer feedback (Reviewed tasks)
+    local MODE
+    if [ -n "${AGENT_ROLE_TAGS:-}" ]; then
+      TASK_ID=$(find_tagged_task "Reviewed" "$AGENT_ROLE_TAGS")
+    else
+      TASK_ID=$(find_actionable_task "Reviewed")
+    fi
+    MODE="review_fixup"
+
+    # Priority 3: start a new Pending task
+    if [ -z "$TASK_ID" ]; then
+      if [ -n "${AGENT_ROLE_TAGS:-}" ]; then
+        TASK_ID=$(find_tagged_task "Pending" "$AGENT_ROLE_TAGS")
+      else
+        TASK_ID=$(find_actionable_task "Pending")
+      fi
+      MODE="fresh"
+    fi
+
+    if [ -z "$TASK_ID" ]; then
+      local IN_REVIEW
+      IN_REVIEW=$(count_tasks "In Review")
+      if [ "$IN_REVIEW" -gt 0 ]; then
+        log_wait "Tasks blocked on review ($IN_REVIEW in review). Retrying in 90s."
+        sleep 90
+        continue
+      fi
+      local PENDING_Q
+      PENDING_Q=$(find_pending_question)
+      if [ -n "$PENDING_Q" ]; then
+        log_wait "Design question pending on $PENDING_Q. Waiting 60s for Architect."
+        sleep 60
+        continue
+      fi
+      log_wait "No actionable tasks. Retrying in 30s."
+      sleep 30
+      continue
+    fi
+
+    # Phase merge check
+    local TASK_PHASE
+    TASK_PHASE=$(task_phase "$TASK_ID")
+    if [ -n "$TASK_PHASE" ] && [ "$TASK_PHASE" -gt 1 ]; then
+      if ! ensure_phases_merged "$TASK_PHASE"; then
+        log_err "Phase merge failed for phase $TASK_PHASE. Resolve conflicts and retry."
+        notify "${role}" "Phase merge conflict on phase $TASK_PHASE" "error"
+        sleep 30
+        continue
+      fi
+    fi
+
+    # Read task content
+    local TASK_CONTENT
+    TASK_CONTENT=$(read_task "$TASK_ID")
+    if [ -z "$TASK_CONTENT" ]; then
+      log_err "Task file not found: tasks/$TASK_ID.md"
+      sleep 10
+      continue
+    fi
+
+    log_info "Picked $TASK_ID (mode: $MODE)"
+    local WORKTREE
+    WORKTREE=$(task_worktree_path "$TASK_ID")
+
+    # Pre-invoke hook
+    if ! run_hooks "pre_invoke" "$TASK_ID" "$WORKTREE"; then
+      log_err "pre_invoke hook failed for $TASK_ID. Skipping."
+      sleep 10
+      continue
+    fi
+
+    # Build prompt and invoke
+    local prompt_tmp
+    prompt_tmp=$(mktemp)
+    {
+      cat "$prompt_file"
+      echo ""
+      echo "---"
+      echo "## Active Task: $TASK_ID"
+      echo "**Mode**: $MODE"
+      echo ""
+      echo "$TASK_CONTENT"
+    } > "$prompt_tmp"
+
+    local EXIT_CODE=0
+    invoke_agent_logged "$prompt_tmp" "$TASK_ID" "$MODE" || EXIT_CODE=$?
+    rm -f "$prompt_tmp"
+
+    # Post-invoke hook (non-fatal)
+    run_hooks "post_invoke" "$TASK_ID" "$WORKTREE" || true
+
+    local CURRENT_STATUS
+    CURRENT_STATUS=$(task_status "$TASK_ID")
+
+    case "$CURRENT_STATUS" in
+      "Done")
+        log_ok "$TASK_ID committed. Moving to next task."
+        notify "${role}" "$TASK_ID done and committed" "success"
+        sleep 2
+        ;;
+      "In Review")
+        log_info "$TASK_ID submitted for review."
+        notify "${role}" "$TASK_ID ready for review" "info"
+        sleep 5
+        ;;
+      "Approved")
+        log_info "$TASK_ID approved but not yet committed. Will commit next loop."
+        sleep 2
+        ;;
+      *)
+        if [ "$EXIT_CODE" -ne 0 ]; then
+          log_err "Agent exited with code $EXIT_CODE on $TASK_ID. Retrying in 30s."
+          notify "${role}" "$TASK_ID agent error (exit $EXIT_CODE)" "error"
+          sleep 30
+        else
+          log_info "$TASK_ID status: $CURRENT_STATUS. Continuing in 10s."
+          sleep 10
+        fi
+        ;;
+    esac
+  done
+}
+
+# lifecycle_reviewer — reviews tasks in "In Review" status
+lifecycle_reviewer() {
+  local role="${AGENT_ROLE:-reviewer}"
+  local prompt_file="${AGENT_PROMPT_FILE:-$PROMPTS_DIR/reviewer.md}"
+
+  require_file "$prompt_file"
+  require_file "$AGENT_LOG"
+
+  export AGENT_EFFORT="${AGENT_EFFORT:-high}"
+
+  log_info "${role} agent starting (instance ${AGENT_INSTANCE:-0})..."
+
+  while true; do
+    _write_heartbeat
+
+    local TOTAL DONE
+    TOTAL=$(total_tasks)
+    DONE=$(count_tasks "Done")
+
+    if [[ "$DONE" -eq "$TOTAL" && "$TOTAL" -gt 0 ]]; then
+      log_ok "All $TOTAL tasks reviewed and approved. Shutting down."
+      notify "${role}" "All $TOTAL tasks reviewed and approved." "success"
+      exit 0
+    fi
+
+    local TASK_ID
+    TASK_ID=$(find_task "In Review")
+
+    if [ -z "$TASK_ID" ]; then
+      log_wait "Nothing to review ($DONE/$TOTAL done). Polling in 60s."
+      sleep 60
+      continue
+    fi
+
+    local TASK_CONTENT
+    TASK_CONTENT=$(read_task "$TASK_ID")
+    if [ -z "$TASK_CONTENT" ]; then
+      log_err "Task file not found: tasks/$TASK_ID.md"
+      sleep 10
+      continue
+    fi
+
+    local WORKTREE
+    WORKTREE=$(task_worktree_path "$TASK_ID")
+
+    local DIFF=""
+    if [ -n "$WORKTREE" ] && [ -d "$PROJECT_ROOT/$WORKTREE" ]; then
+      DIFF=$(git -C "$PROJECT_ROOT/$WORKTREE" diff HEAD~1..HEAD 2>/dev/null \
+             || git -C "$PROJECT_ROOT/$WORKTREE" diff HEAD 2>/dev/null \
+             || echo "(no diff available)")
+      if [ ${#DIFF} -gt 30000 ]; then
+        DIFF="${DIFF:0:30000}
+... (diff truncated at 30KB — review key files manually if needed)"
+      fi
+    fi
+
+    log_info "Reviewing $TASK_ID..."
+
+    run_hooks "pre_invoke" "$TASK_ID" "$WORKTREE" || true
+
+    local prompt_tmp
+    prompt_tmp=$(mktemp)
+    {
+      cat "$prompt_file"
+      echo ""
+      echo "---"
+      echo "## Task Under Review: $TASK_ID"
+      echo ""
+      echo "$TASK_CONTENT"
+      echo ""
+      echo "## Git Diff"
+      echo '```diff'
+      echo "$DIFF"
+      echo '```'
+    } > "$prompt_tmp"
+
+    invoke_agent_logged "$prompt_tmp" "$TASK_ID" "review" || true
+    rm -f "$prompt_tmp"
+
+    run_hooks "post_invoke" "$TASK_ID" "$WORKTREE" || true
+
+    local NEW_STATUS
+    NEW_STATUS=$(task_status "$TASK_ID")
+
+    case "$NEW_STATUS" in
+      "Approved")
+        log_ok "$TASK_ID approved."
+        notify "${role}" "$TASK_ID approved" "success"
+        ;;
+      "Reviewed")
+        log_info "$TASK_ID has review comments for Implementer to address."
+        notify "${role}" "$TASK_ID reviewed — changes requested" "info"
+        ;;
+      *)
+        log_info "$TASK_ID status after review: $NEW_STATUS"
+        ;;
+    esac
+
+    sleep 5
+  done
+}
+
+# _qa_answer_question — one-shot answer for a single design question
+_qa_answer_question() {
+  local task_file="$1"
+  local task_id
+  task_id=$(basename "$task_file" .md)
+
+  log_info "Answering design question in $task_id..."
+
+  local qa_section task_context
+  qa_section=$(awk '/^## Design Q&A/,/^## [^D]/' "$task_file" | head -50)
+  task_context=$(awk '/^# TASK-/,/^## (Implementer|Test Results)/' "$task_file" | head -40)
+
+  local prompt_tmp
+  prompt_tmp=$(mktemp)
+  {
+    if [ -f "${AGENT_PROMPT_FILE:-}" ]; then
+      cat "$AGENT_PROMPT_FILE"
+      echo ""
+      echo "---"
+      echo "## Task requiring an answer:"
+      echo "File: $task_file"
+    else
+      echo "You are the Architect for this project."
+      echo "A design question needs answering. Read IMPLEMENTATION_PLAN.md for architectural context if needed."
+    fi
+    echo ""
+    echo "Task context:"
+    echo "$task_context"
+    echo ""
+    echo "Question to answer:"
+    echo "$qa_section"
+    echo ""
+    echo "Instructions:"
+    echo "1. Answer the pending question concisely in the task file ($task_file)."
+    echo "2. Change its Status from 'Pending' to 'Answered'."
+    echo "3. Append one line to AGENT_LOG.md Activity Log."
+    echo "4. Stop."
+  } > "$prompt_tmp"
+
+  invoke_agent_logged "$prompt_tmp" "$task_id" "qa" || true
+  rm -f "$prompt_tmp"
+
+  log_ok "Answered question in $task_id"
+  notify "${AGENT_ROLE:-qa}" "Design question answered in $task_id" "info"
+}
+
+# lifecycle_qa_responder — answers design questions with one-shot invocations
+lifecycle_qa_responder() {
+  local poll_interval="${POLL_INTERVAL:-120}"
+  local loop_mode="${AGENT_LOOP_MODE:-true}"
+
+  export AGENT_ALLOWED_TOOLS="${AGENT_ALLOWED_TOOLS:-Read,Write,Edit}"
+  export AGENT_MAX_TURNS="${AGENT_MAX_TURNS:-10}"
+
+  log_info "QA Responder starting (poll interval: ${poll_interval}s)..."
+
+  while true; do
+    _write_heartbeat
+
+    local pending_files
+    pending_files=$(grep -rl "Status: Pending" "$TASKS_DIR"/ 2>/dev/null || true)
+
+    if [ -z "$pending_files" ]; then
+      if [ "$loop_mode" = "false" ]; then
+        log_info "No pending questions. Exiting."
+        exit 0
+      fi
+      log_wait "No pending questions. Checking in ${poll_interval}s."
+      sleep "$poll_interval"
+      continue
+    fi
+
+    for task_file in $pending_files; do
+      _qa_answer_question "$task_file"
+      sleep 3
+    done
+
+    if [ "$loop_mode" = "false" ]; then
+      exit 0
+    fi
+
+    sleep "$poll_interval"
+  done
 }
 
 # ── Graceful shutdown ───────────────────────────────────────────────────────

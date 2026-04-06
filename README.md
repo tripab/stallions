@@ -1,4 +1,4 @@
-# Stallions v3 — Multi-Agent Orchestration Starter Pack
+# Stallions - A Lightweight Multi-Agent Orchestration Setup
 
 A lightweight orchestration setup for running multiple specialised coding agents on any project. Provider-agnostic — works with Claude Code, Codex CLI, OpenCode, Aider, or any agent with a CLI. Everything is bash + markdown: no daemon, no database, no compiled binary.
 
@@ -21,10 +21,10 @@ cd /path/to/your/project
 claude --prompt-file prompts/architect.md
 
 # 5. After the Architect creates AGENT_LOG.md and tasks/, launch workers
-#    Option A — supervisor (v3, spawns all roles from orchestration.toml)
+#    Option A — supervisor (spawns all roles from orchestration.toml)
 ./scripts/supervisor.sh
 
-#    Option B — manual (v2-compatible, launch each role in its own terminal)
+#    Option B — manual (launch each role in its own terminal)
 ./scripts/run_agent.sh --role implementer   # terminal 1
 ./scripts/run_agent.sh --role reviewer      # terminal 2
 ./scripts/run_agent.sh --role qa            # terminal 3 (optional)
@@ -33,7 +33,7 @@ claude --prompt-file prompts/architect.md
 ./scripts/status.sh
 ```
 
-### Role-specific agents (v3)
+### Role-specific agents
 
 ```bash
 # Launch a backend-specialised agent (reads prompts/backend.md, handles backend.* tags)
@@ -51,39 +51,32 @@ claude --prompt-file prompts/architect.md
 
 ## Architecture
 
-```
-                              ┌──────────────────────┐
-                              │   orchestration.toml  │
-                              │  roles, tags, logging │
-                              └──────────┬───────────┘
-                                         │ reads
-                              ┌──────────▼───────────┐
-                              │     supervisor.sh     │
-                              │  spawns & monitors    │
-                              └──┬──────┬──────┬──────┘
-                                 │      │      │
-                        ┌────────┘  ┌───┘  ┌──┘
-                        ▼           ▼      ▼
-                  run_agent.sh  run_agent.sh  run_agent.sh
-                  --role backend  --role frt   --role reviewer
-                        │           │              │
-                        └─────┬─────┘              │
-                              │ bash pre-filters    │ bash pre-filters
-                              │ injects single task │ injects diff + task
-                              ▼                     ▼
-                        coding agent           coding agent
-                        (any provider)         (any provider)
-                              │                     │
-                              └──────┬──────────────┘
-                                     │ writes
-                              ┌──────▼──────────────┐
-                              │    AGENT_LOG.md      │
-                              │  tasks/TASK-*.md     │
-                              │  logs/*.jsonl        │
-                              └─────────────────────┘
+```mermaid
+flowchart TD
+    config["orchestration.toml\nroles · tags · logging"]
+    supervisor["supervisor.sh\nspawns & monitors"]
+    backend["run_agent.sh\n--role backend"]
+    frontend["run_agent.sh\n--role frontend"]
+    reviewer["run_agent.sh\n--role reviewer"]
+    agent_impl["coding agent\n(any provider)"]
+    agent_rev["coding agent\n(any provider)"]
+    files["AGENT_LOG.md\ntasks/TASK-*.md\nlogs/*.jsonl"]
+    signals["$SIGNAL_DIR\nmailboxes/ · locks/\nheartbeats/"]
+
+    config -->|reads| supervisor
+    supervisor --> backend
+    supervisor --> frontend
+    supervisor --> reviewer
+    backend -->|bash pre-filters\ninjects single task| agent_impl
+    frontend -->|bash pre-filters\ninjects single task| agent_impl
+    reviewer -->|bash pre-filters\ninjects diff + task| agent_rev
+    agent_impl -->|writes status| files
+    agent_rev -->|writes status| files
+    agent_impl -->|send_mail on In Review| signals
+    reviewer -->|check_mail · claim_task| signals
 ```
 
-The key structural change from v2: `run_implementer.sh`, `run_reviewer.sh`, and `run_qa_responder.sh` are now one-line shims that delegate to the generic **`run_agent.sh`**, which reads its behaviour (prompt, tags, model, hooks) from `orchestration.toml`.
+`run_implementer.sh`, `run_reviewer.sh`, and `run_qa_responder.sh` are one-line shims that delegate to the generic **`run_agent.sh`**, which reads its behaviour (prompt, tags, model, hooks) from `orchestration.toml`.
 
 ## Configuration: orchestration.toml
 
@@ -152,6 +145,43 @@ Routing uses **prefix matching**: a role with `tags = ["backend"]` claims tasks 
 
 All three are defined in `common.sh` and can be used independently of `run_agent.sh`.
 
+### Task Locking
+
+When multiple implementer instances run in parallel, `claim_task()` / `release_task()` prevent races. The lock is an atomic `mkdir` on `$SIGNAL_DIR/locks/<task_id>.lock/` — only one process wins.
+
+```mermaid
+sequenceDiagram
+    participant A as implementer_0
+    participant B as implementer_1
+    participant L as locks/TASK-003.lock
+
+    A->>L: mkdir (claim_task)
+    Note over L: created — A wins
+    B->>L: mkdir (claim_task)
+    Note over B: returns 1 — skip to next candidate
+    A->>L: rm -rf (release_task after In Review)
+```
+
+`find_actionable_task()` and `find_tagged_task()` skip locked tasks automatically, so agents route around each other without polling.
+
+### Mailbox Messaging
+
+Implementers notify the reviewer the moment a task transitions to "In Review" — no polling delay:
+
+```mermaid
+sequenceDiagram
+    participant I as lifecycle_implementer
+    participant M as mailboxes/reviewer_0/inbox
+    participant R as lifecycle_reviewer
+
+    I->>M: send_mail "task_ready" TASK-003
+    Note over R: next loop iteration
+    R->>M: check_mail → ack_mail
+    Note over R: skips 60s sleep, reviews immediately
+```
+
+Mail files live in `$SIGNAL_DIR/mailboxes/<role>/inbox/` and are moved to `processed/` after acknowledgement.
+
 ### Lifecycle Hooks
 
 Optional shell scripts run before and after each agent invocation. Zero tokens spent — pure bash.
@@ -194,6 +224,8 @@ The core insight: **bash can parse a markdown table for free; the coding agent c
 | QA responder | One-shot invocations instead of polling inside a session | Prevents context blowup |
 | Idle detection | Shell detects no-work states without invoking agent | 100% saving on idle cycles |
 | Crash recovery | Approved→Done commit runs in pure bash | 100% saving per recovered task |
+| Mailbox wake-up | Reviewer skips 60s poll sleep when mail arrives | Faster review cycle |
+| Task locking | Agents skip locked tasks without invoking | 0 tokens on race-lost candidates |
 
 **Estimated overall saving: 60–90% token reduction vs. naive agent-driven coordination.**
 
@@ -211,7 +243,7 @@ All in bash. Merge conflicts pause the script with an error; resolve manually an
 
 Restart any runner script after a crash — it picks up exactly where it left off. Approved-but-not-committed tasks are committed in pure bash (zero tokens) on the next loop iteration.
 
-### Supervisor (v3)
+### Supervisor
 
 `supervisor.sh` reads `orchestration.toml` and manages the full agent fleet:
 
@@ -382,7 +414,8 @@ your-project/
 │   └── _template.sh            # Copy this for your own agent
 ├── scripts/
 │   ├── common.sh               # Shared utilities: task parsing, lifecycle functions,
-│   │                           #   config loading, logging, token parsing, hooks
+│   │                           #   config loading, logging, token parsing, hooks,
+│   │                           #   task locking (claim/release), mailbox functions
 │   ├── run_agent.sh            # Generic runner — dispatches by role type
 │   ├── run_implementer.sh      # v2 shim → run_agent.sh --role implementer
 │   ├── run_reviewer.sh         # v2 shim → run_agent.sh --role reviewer
@@ -425,11 +458,19 @@ All settings have `orchestration.toml` equivalents. Env vars are useful for one-
 | `SLACK_ENABLED` | false | Set to `"true"` to activate Slack notifications |
 | `SLACK_BOT_TOKEN` | (unset) | Slack bot OAuth token (`xoxb-…`) — never commit this |
 
-## v2 → v3 Migration
+## Migration Guide
 
-v3 is a **superset of v2** — all v2 scripts still work unchanged.
+Stallions is designed to be adopted incrementally. Each layer adds capability without breaking what came before.
 
-| What changed | v2 | v3 |
+```mermaid
+flowchart LR
+    v1["v1\nManual terminals\nrun_implementer.sh"] -->|add orchestration.toml\nrun_agent.sh| v2
+    v2["v2\nRole-based runner\ntag routing\nJSONL logging"] -->|add supervisor.sh\nSlack notifications| v3
+    v3["v3\nSupervised fleet\nheartbeat monitoring\nSlack threads"] -->|add mailboxes\ntask locking\nprompt templates| v4
+    v4["v4\nMulti-agent safe\nfast reviewer wake-up\nspecialised prompts"]
+```
+
+| What changed | Before | After |
 |---|---|---|
 | Runner scripts | `run_implementer.sh` etc. | One-line shims → `run_agent.sh` |
 | New agent types | Write a new `run_<type>.sh` | Add a `[roles.<name>]` block to `orchestration.toml` |
@@ -437,3 +478,6 @@ v3 is a **superset of v2** — all v2 scripts still work unchanged.
 | Config | Environment variables only | `orchestration.toml` + env overrides |
 | Logging | Activity log in AGENT_LOG.md | Structured JSONL per invocation |
 | Supervision | Open N terminals manually | `supervisor.sh` spawns and monitors all agents |
+| Multi-agent safety | Race conditions possible | `claim_task()` / `release_task()` atomic locking |
+| Reviewer latency | 60s poll interval | Instant wake-up via mailbox on task submission |
+| Prompt coverage | Generic implementer only | Role-specific prompts for backend, frontend, tester, devops, qa |

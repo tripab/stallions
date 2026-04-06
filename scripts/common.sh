@@ -535,6 +535,32 @@ read_signal() {
   cat "$SIGNAL_DIR/${agent}_signal.txt" 2>/dev/null || echo ""
 }
 
+# ── Task locking ─────────────────────────────────────────────────────────────
+
+# Atomically claim a task by creating a lock directory via mkdir.
+# mkdir is atomic on POSIX filesystems — only one caller wins the race.
+# Usage: claim_task <task_id> <role>
+# Returns: 0 on success, 1 if already claimed by another agent.
+claim_task() {
+  local task_id="$1"
+  local role="$2"
+  local lock_dir="$SIGNAL_DIR/locks/${task_id}.lock"
+  mkdir -p "$SIGNAL_DIR/locks"
+  if mkdir "$lock_dir" 2>/dev/null; then
+    echo "$role" > "${lock_dir}/owner"
+    return 0
+  fi
+  return 1
+}
+
+# Release a task lock created by claim_task.
+# Usage: release_task <task_id>
+release_task() {
+  local task_id="$1"
+  local lock_dir="$SIGNAL_DIR/locks/${task_id}.lock"
+  rm -rf "$lock_dir"
+}
+
 # ── Mailbox functions ────────────────────────────────────────────────────────
 
 # Send a message to another role's inbox.

@@ -613,6 +613,166 @@ notify() {
   fi
 }
 
+# ── Slack notifications ──────────────────────────────────────────────────────
+
+# Resolve the Slack channel ID for a given event type.
+# Falls back to the default_channel if no specific channel is configured.
+# Usage: get_slack_channel "task_in_review" → "C0GENERAL123"
+get_slack_channel() {
+  local event_type="$1"
+  local channel=""
+
+  if [ -f "$ORCHESTRATION_TOML" ] && command -v tomlq &>/dev/null; then
+    channel=$(tomlq -r ".notifications.slack.channels.${event_type} // empty" \
+      "$ORCHESTRATION_TOML" 2>/dev/null || true)
+    if [ -z "$channel" ]; then
+      channel=$(tomlq -r '.notifications.slack.default_channel // empty' \
+        "$ORCHESTRATION_TOML" 2>/dev/null || true)
+    fi
+  fi
+
+  echo "${channel:-}"
+}
+
+# Post a message to Slack, threading per-task when thread_per_task=true.
+#
+# Usage: notify_slack <event_type> <message> <color> [task_id]
+#   event_type — matches [notifications.slack.channels] key (e.g. "task_in_review")
+#   message    — plain text or mrkdwn string
+#   color      — hex color or "good"/"warning"/"danger"
+#   task_id    — optional; used for thread grouping
+#
+# Required env vars:
+#   SLACK_BOT_TOKEN — OAuth bot token (xoxb-...)
+#   SLACK_ENABLED   — set to "true" to actually send (default: false)
+notify_slack() {
+  local event_type="$1"
+  local message="$2"
+  local color="${3:-good}"
+  local task_id="${4:-}"
+
+  # Guard: only send when explicitly enabled
+  local slack_enabled="${SLACK_ENABLED:-false}"
+  [ "$slack_enabled" = "true" ] || return 0
+
+  local token="${SLACK_BOT_TOKEN:-}"
+  if [ -z "$token" ]; then
+    log_err "notify_slack: SLACK_BOT_TOKEN is not set. Skipping notification."
+    return 0
+  fi
+
+  local channel
+  channel=$(get_slack_channel "$event_type")
+  if [ -z "$channel" ]; then
+    log_info "notify_slack: no channel configured for event '$event_type'. Skipping."
+    return 0
+  fi
+
+  # Read Slack config for username/icon
+  local username icon_emoji thread_per_task
+  username=$(tomlq -r '.notifications.slack.username // "Orchestrator"' \
+    "$ORCHESTRATION_TOML" 2>/dev/null || echo "Orchestrator")
+  icon_emoji=$(tomlq -r '.notifications.slack.icon_emoji // ":robot_face:"' \
+    "$ORCHESTRATION_TOML" 2>/dev/null || echo ":robot_face:")
+  thread_per_task=$(tomlq -r '.notifications.slack.thread_per_task // true' \
+    "$ORCHESTRATION_TOML" 2>/dev/null || echo "true")
+
+  # Check for an existing thread timestamp for this task
+  local thread_ts="" thread_file=""
+  if [ -n "$task_id" ] && [ "$thread_per_task" = "true" ]; then
+    mkdir -p "$SIGNAL_DIR/slack_threads"
+    thread_file="$SIGNAL_DIR/slack_threads/${task_id}.ts"
+    [ -f "$thread_file" ] && thread_ts=$(cat "$thread_file" 2>/dev/null || true)
+  fi
+
+  # Build JSON payload
+  local project_name
+  project_name=$(tomlq -r '.project.name // "Stallions"' \
+    "$ORCHESTRATION_TOML" 2>/dev/null || echo "Stallions")
+
+  local context_text="$project_name"
+  [ -n "$task_id" ] && context_text="$project_name · $task_id"
+
+  local payload
+  payload=$(printf '{
+  "channel": "%s",
+  "username": "%s",
+  "icon_emoji": "%s",
+  "attachments": [
+    {
+      "color": "%s",
+      "mrkdwn_in": ["text"],
+      "text": "%s",
+      "footer": "%s"
+    }
+  ]
+}' \
+    "$channel" \
+    "$username" \
+    "$icon_emoji" \
+    "$color" \
+    "$(echo "$message" | sed 's/"/\\"/g')" \
+    "$context_text")
+
+  # Add thread_ts to payload when replying to an existing thread
+  if [ -n "$thread_ts" ]; then
+    payload=$(echo "$payload" | sed "s/\"channel\"/\"thread_ts\": \"${thread_ts}\", \"channel\"/")
+  fi
+
+  # Post to Slack
+  local response
+  response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: application/json; charset=utf-8" \
+    --data "$payload" 2>/dev/null || true)
+
+  # On first message for a task, save the returned ts for future threading
+  if [ -n "$thread_file" ] && [ -z "$thread_ts" ] && [ -n "$response" ]; then
+    local returned_ts
+    returned_ts=$(echo "$response" | grep -o '"ts":"[^"]*"' | head -1 | sed 's/"ts":"//;s/"//')
+    [ -n "$returned_ts" ] && echo "$returned_ts" > "$thread_file"
+  fi
+
+  # Log errors but never fail the calling script
+  local ok
+  ok=$(echo "$response" | grep -o '"ok":[a-z]*' | sed 's/"ok"://')
+  if [ "$ok" != "true" ]; then
+    local err
+    err=$(echo "$response" | grep -o '"error":"[^"]*"' | sed 's/"error":"//;s/"//')
+    log_err "notify_slack: Slack API error for event '$event_type': ${err:-unknown}"
+  fi
+
+  return 0
+}
+
+# ── External notification abstraction ────────────────────────────────────────
+
+# Single call-point for all outbound notifications.
+# Calls both Slack and the desktop/terminal notify().
+#
+# Usage: notify_external <event_type> <message> <color> [task_id]
+#   event_type — Slack channel routing key (e.g. "task_in_review")
+#   message    — human-readable message
+#   color      — "good" | "warning" | "danger" | hex
+#   task_id    — optional task ID for Slack threading
+notify_external() {
+  local event_type="$1"
+  local message="$2"
+  local color="${3:-good}"
+  local task_id="${4:-}"
+
+  # Map color to desktop notification level
+  local level="info"
+  case "$color" in
+    good)    level="success" ;;
+    danger)  level="error"   ;;
+    warning) level="info"    ;;
+  esac
+
+  notify "Orchestrator" "$message" "$level"
+  notify_slack "$event_type" "$message" "$color" "$task_id"
+}
+
 # ── Provider-agnostic agent invocation ─────────────────────────────────────
 
 # Load a provider config file that defines how to invoke the coding agent.

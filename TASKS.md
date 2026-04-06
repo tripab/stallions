@@ -190,12 +190,12 @@ Write the QA/design-question-answering prompt, consolidating the inline prompt f
 | P2-T8 | Implement `parse_tokens()` in common.sh | 2 | Done |
 | P2-T9 | Response capture via tee | 2 | Done |
 | P2-T10 | Log directory setup in setup.sh | 2 | Done |
-| P3-T1 | Create supervisor.sh — spawn logic | 3 | Not Started |
-| P3-T2 | Heartbeat monitoring and re-spawn in supervisor.sh | 3 | Not Started |
-| P3-T3 | Graceful shutdown in supervisor.sh | 3 | Not Started |
-| P3-T4 | Heartbeat writing in run_agent.sh | 3 | Not Started |
-| P3-T5 | Implement `notify_slack()` in common.sh | 3 | Not Started |
-| P3-T6 | Implement `notify_external()` abstraction in common.sh | 3 | Not Started |
+| P3-T1 | Create supervisor.sh — spawn logic | 3 | Done |
+| P3-T2 | Heartbeat monitoring and re-spawn in supervisor.sh | 3 | Done |
+| P3-T3 | Graceful shutdown in supervisor.sh | 3 | Done |
+| P3-T4 | Heartbeat writing in run_agent.sh | 3 | Done |
+| P3-T5 | Implement `notify_slack()` in common.sh | 3 | Done |
+| P3-T6 | Implement `notify_external()` abstraction in common.sh | 3 | Done |
 | P3-T7 | Add Slack event hook points in run_agent.sh and supervisor.sh | 3 | Not Started |
 | P3-T8 | Update setup.sh — generate orchestration.toml template | 3 | Not Started |
 | P3-T9 | Update status.sh — per-role progress | 3 | Not Started |

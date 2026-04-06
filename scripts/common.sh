@@ -1271,6 +1271,7 @@ lifecycle_implementer() {
       "In Review")
         log_info "$TASK_ID submitted for review."
         notify_external "task_in_review" "$TASK_ID ready for review" "warning" "$TASK_ID"
+        send_mail "reviewer_0" "task_ready" "$TASK_ID"
         release_task "$TASK_ID"
         sleep 5
         ;;
@@ -1310,6 +1311,15 @@ lifecycle_reviewer() {
   while true; do
     _write_heartbeat
 
+    # Drain the mailbox: ack all pending task_ready notifications and note
+    # whether any arrived so we can skip the idle sleep below.
+    local _mail_file _has_mail=false
+    while IFS= read -r _mail_file; do
+      [ -n "$_mail_file" ] || continue
+      ack_mail "$_mail_file"
+      _has_mail=true
+    done < <(check_mail "reviewer_0")
+
     local TOTAL DONE
     TOTAL=$(total_tasks)
     DONE=$(count_tasks "Done")
@@ -1324,6 +1334,11 @@ lifecycle_reviewer() {
     TASK_ID=$(find_task "In Review")
 
     if [ -z "$TASK_ID" ]; then
+      if [ "$_has_mail" = "true" ]; then
+        # Mail arrived but task may not be visible yet — retry immediately.
+        log_info "Mail received — rechecking for tasks immediately."
+        continue
+      fi
       log_wait "Nothing to review ($DONE/$TOTAL done). Polling in 60s."
       sleep 60
       continue

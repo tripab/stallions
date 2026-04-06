@@ -199,10 +199,10 @@ Write the QA/design-question-answering prompt, consolidating the inline prompt f
 | P3-T7 | Add Slack event hook points in run_agent.sh and supervisor.sh | 3 | Done |
 | P3-T8 | Update setup.sh — generate orchestration.toml template | 3 | Done |
 | P3-T9 | Update status.sh — per-role progress | 3 | Done |
-| P4-T1 | Mailbox functions in common.sh | 4 | Not Started |
-| P4-T2 | Task locking — `claim_task()` and `release_task()` | 4 | Not Started |
-| P4-T3 | Integrate task locking into lifecycle_implementer() | 4 | Not Started |
-| P4-T4 | Mailbox-driven reviewer notification | 4 | Not Started |
+| P4-T1 | Mailbox functions in common.sh | 4 | Done |
+| P4-T2 | Task locking — `claim_task()` and `release_task()` | 4 | Done |
+| P4-T3 | Integrate task locking into lifecycle_implementer() | 4 | Done |
+| P4-T4 | Mailbox-driven reviewer notification | 4 | Done |
 | P4-T5 | Create prompts/backend.md | 4 | Not Started |
 | P4-T6 | Create prompts/frontend.md | 4 | Not Started |
 | P4-T7 | Create prompts/tester.md | 4 | Not Started |

@@ -196,7 +196,7 @@ monitor_loop() {
       if [ "$restart_count" -ge "$MAX_RESTART_COUNT" ]; then
         log_err "$key has exceeded max restarts ($MAX_RESTART_COUNT). Escalating."
         _record_escalation "$key" "$reason"
-        notify "Supervisor" "$key failed permanently after $MAX_RESTART_COUNT restarts" "error"
+        notify_external "agent_failed" "$key failed permanently after $MAX_RESTART_COUNT restarts" "danger"
         # Remove from tracked set so we don't keep re-escalating
         unset "AGENT_PIDS[$key]"
         unset "AGENT_ROLES[$key]"
@@ -215,7 +215,7 @@ monitor_loop() {
     # Check if all tasks are done (no more agents to track)
     if [ "${#AGENT_PIDS[@]}" -eq 0 ]; then
       log_ok "All agents have completed. Supervisor exiting."
-      notify "Supervisor" "All agents finished — project complete" "success"
+      notify_external "all_tasks_done" "All agents finished — project complete" "good"
       exit 0
     fi
   done

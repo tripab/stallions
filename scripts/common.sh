@@ -489,9 +489,11 @@ ensure_phases_merged() {
       git -C "$PROJECT_ROOT" checkout main
       if git -C "$PROJECT_ROOT" merge "$branch" -m "Merge phase $phase ($branch) into main"; then
         log_ok "Merged $branch into main"
+        notify_external "phase_merged" "Phase $phase ($branch) merged into main" "good"
         merged_any=true
       else
         log_err "Merge conflict merging $branch into main! Resolve manually."
+        notify_external "phase_merge_needed" "Merge conflict: $branch → main (phase $phase)" "danger"
         git -C "$PROJECT_ROOT" merge --abort 2>/dev/null
         git -C "$PROJECT_ROOT" checkout "$current_branch" 2>/dev/null
         return 1
@@ -1166,12 +1168,12 @@ lifecycle_implementer() {
     case "$CURRENT_STATUS" in
       "Done")
         log_ok "$TASK_ID committed. Moving to next task."
-        notify "${role}" "$TASK_ID done and committed" "success"
+        notify_external "task_committed" "$TASK_ID done and committed" "good" "$TASK_ID"
         sleep 2
         ;;
       "In Review")
         log_info "$TASK_ID submitted for review."
-        notify "${role}" "$TASK_ID ready for review" "info"
+        notify_external "task_in_review" "$TASK_ID ready for review" "warning" "$TASK_ID"
         sleep 5
         ;;
       "Approved")
@@ -1279,11 +1281,11 @@ lifecycle_reviewer() {
     case "$NEW_STATUS" in
       "Approved")
         log_ok "$TASK_ID approved."
-        notify "${role}" "$TASK_ID approved" "success"
+        notify_external "review_approved" "$TASK_ID approved" "good" "$TASK_ID"
         ;;
       "Reviewed")
         log_info "$TASK_ID has review comments for Implementer to address."
-        notify "${role}" "$TASK_ID reviewed — changes requested" "info"
+        notify_external "review_submitted" "$TASK_ID reviewed — changes requested" "warning" "$TASK_ID"
         ;;
       *)
         log_info "$TASK_ID status after review: $NEW_STATUS"

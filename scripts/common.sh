@@ -535,6 +535,46 @@ read_signal() {
   cat "$SIGNAL_DIR/${agent}_signal.txt" 2>/dev/null || echo ""
 }
 
+# ── Mailbox functions ────────────────────────────────────────────────────────
+
+# Send a message to another role's inbox.
+# Usage: send_mail <recipient_role> <subject> <body>
+send_mail() {
+  local recipient_role="$1"
+  local subject="$2"
+  local body="$3"
+  local inbox="$SIGNAL_DIR/mailboxes/${recipient_role}/inbox"
+  mkdir -p "$inbox"
+  local ts
+  ts=$(date -u '+%Y%m%d_%H%M%S')
+  local msg_file="${inbox}/${ts}_${subject}.mail"
+  printf 'Subject: %s\nTimestamp: %s\n\n%s\n' "$subject" "$ts" "$body" > "$msg_file"
+  log_info "Mail sent to ${recipient_role}: $subject"
+}
+
+# List unread messages in a role's inbox.
+# Prints one absolute filename per line, sorted by time (oldest first).
+# Usage: check_mail <role>
+check_mail() {
+  local role="$1"
+  local inbox="$SIGNAL_DIR/mailboxes/${role}/inbox"
+  [ -d "$inbox" ] || return 0
+  find "$inbox" -maxdepth 1 -name '*.mail' -type f 2>/dev/null | sort
+}
+
+# Acknowledge (move) a processed message out of the inbox.
+# Derives the role from the mailbox path: .../mailboxes/<role>/inbox/<file>
+# Usage: ack_mail <message_file>
+ack_mail() {
+  local msg_file="$1"
+  [ -f "$msg_file" ] || return 0
+  local role
+  role=$(echo "$msg_file" | sed 's|.*/mailboxes/\([^/]*\)/inbox/.*|\1|')
+  local processed="$SIGNAL_DIR/mailboxes/${role}/processed"
+  mkdir -p "$processed"
+  mv "$msg_file" "$processed/"
+}
+
 # ── Final merge: all phases → main ────────────────────────────────────────
 
 # Merge every completed phase into main. Called at project completion.

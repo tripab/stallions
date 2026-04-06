@@ -197,12 +197,13 @@ deps_met() {
   return 0
 }
 
-# Find first actionable task: status matches pattern AND deps are met.
+# Find first actionable task: status matches pattern AND deps are met AND not locked.
 find_actionable_task() {
   local status_pattern="$1"
   local candidates
   candidates=$(find_all_tasks "$status_pattern")
   for task_id in $candidates; do
+    is_task_locked "$task_id" && continue
     if deps_met "$task_id"; then
       echo "$task_id"
       return
@@ -249,7 +250,10 @@ find_tagged_task() {
   candidates=$(find_all_tasks "$status_pattern")
 
   for task_id in $candidates; do
-    # Dependency check first (cheap)
+    # Lock check before anything else (skip tasks claimed by other agents)
+    is_task_locked "$task_id" && continue
+
+    # Dependency check
     deps_met "$task_id" || continue
 
     # If no Tags column or role_tags is wildcard, any task qualifies
@@ -536,6 +540,13 @@ read_signal() {
 }
 
 # ── Task locking ─────────────────────────────────────────────────────────────
+
+# Return 0 if the task is currently locked (by any agent), 1 if free.
+# Usage: is_task_locked <task_id>
+is_task_locked() {
+  [ -d "$SIGNAL_DIR/locks/${1}.lock" ]
+}
+
 
 # Atomically claim a task by creating a lock directory via mkdir.
 # mkdir is atomic on POSIX filesystems — only one caller wins the race.
@@ -1097,12 +1108,19 @@ lifecycle_implementer() {
     local TASK_ID
     TASK_ID=$(find_task "Approved")
     if [ -n "$TASK_ID" ]; then
+      # Skip if another agent is already committing this task
+      if ! claim_task "$TASK_ID" "$role"; then
+        sleep 2
+        continue
+      fi
+
       local TITLE WORKTREE TASK_PHASE
       TITLE=$(task_title "$TASK_ID")
       WORKTREE=$(task_worktree_path "$TASK_ID")
 
       if [ -z "$WORKTREE" ] || [ ! -d "$PROJECT_ROOT/$WORKTREE" ]; then
         log_err "$TASK_ID approved but worktree not found at $WORKTREE. Skipping."
+        release_task "$TASK_ID"
         sleep 10
         continue
       fi
@@ -1114,6 +1132,7 @@ lifecycle_implementer() {
         if ! ensure_phases_merged "$TASK_PHASE"; then
           log_err "Phase merge failed for phase $TASK_PHASE. Resolve conflicts and retry."
           notify "${role}" "Phase merge conflict on phase $TASK_PHASE" "error"
+          release_task "$TASK_ID"
           sleep 30
           continue
         fi
@@ -1133,6 +1152,7 @@ lifecycle_implementer() {
       append_activity_log "${role}" "$TASK_ID committed and Done (crash recovery)"
       log_ok "$TASK_ID → Done (zero tokens)"
       notify "${role}" "$TASK_ID committed (crash recovery)" "success"
+      release_task "$TASK_ID"
       sleep 2
       continue
     fi
@@ -1176,6 +1196,13 @@ lifecycle_implementer() {
       continue
     fi
 
+    # TOCTOU guard: claim the task atomically before doing any work.
+    # find_tagged_task already skips locked tasks, but there is a small
+    # window between the find and here; if we lose the race, just retry.
+    if ! claim_task "$TASK_ID" "$role"; then
+      continue
+    fi
+
     # Phase merge check
     local TASK_PHASE
     TASK_PHASE=$(task_phase "$TASK_ID")
@@ -1183,6 +1210,7 @@ lifecycle_implementer() {
       if ! ensure_phases_merged "$TASK_PHASE"; then
         log_err "Phase merge failed for phase $TASK_PHASE. Resolve conflicts and retry."
         notify "${role}" "Phase merge conflict on phase $TASK_PHASE" "error"
+        release_task "$TASK_ID"
         sleep 30
         continue
       fi
@@ -1193,6 +1221,7 @@ lifecycle_implementer() {
     TASK_CONTENT=$(read_task "$TASK_ID")
     if [ -z "$TASK_CONTENT" ]; then
       log_err "Task file not found: tasks/$TASK_ID.md"
+      release_task "$TASK_ID"
       sleep 10
       continue
     fi
@@ -1204,6 +1233,7 @@ lifecycle_implementer() {
     # Pre-invoke hook
     if ! run_hooks "pre_invoke" "$TASK_ID" "$WORKTREE"; then
       log_err "pre_invoke hook failed for $TASK_ID. Skipping."
+      release_task "$TASK_ID"
       sleep 10
       continue
     fi
@@ -1235,14 +1265,17 @@ lifecycle_implementer() {
       "Done")
         log_ok "$TASK_ID committed. Moving to next task."
         notify_external "task_committed" "$TASK_ID done and committed" "good" "$TASK_ID"
+        release_task "$TASK_ID"
         sleep 2
         ;;
       "In Review")
         log_info "$TASK_ID submitted for review."
         notify_external "task_in_review" "$TASK_ID ready for review" "warning" "$TASK_ID"
+        release_task "$TASK_ID"
         sleep 5
         ;;
       "Approved")
+        # Lock stays held — the next loop iteration will commit and release.
         log_info "$TASK_ID approved but not yet committed. Will commit next loop."
         sleep 2
         ;;
@@ -1250,9 +1283,11 @@ lifecycle_implementer() {
         if [ "$EXIT_CODE" -ne 0 ]; then
           log_err "Agent exited with code $EXIT_CODE on $TASK_ID. Retrying in 30s."
           notify "${role}" "$TASK_ID agent error (exit $EXIT_CODE)" "error"
+          release_task "$TASK_ID"
           sleep 30
         else
           log_info "$TASK_ID status: $CURRENT_STATUS. Continuing in 10s."
+          release_task "$TASK_ID"
           sleep 10
         fi
         ;;

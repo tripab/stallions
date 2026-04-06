@@ -215,10 +215,134 @@ Restart any runner script after a crash — it picks up exactly where it left of
 
 `supervisor.sh` reads `orchestration.toml` and manages the full agent fleet:
 
-- Spawns one `run_agent.sh` process per role instance
-- Monitors heartbeat files; restarts agents that crash or go silent
-- Caps restarts at `max_restart_count` then escalates
-- Shuts down all agents gracefully on `Ctrl-C`
+- Spawns one `run_agent.sh` process per role instance (`instances > 0`, `type != interactive`)
+- Every agent writes a heartbeat file at `$SIGNAL_DIR/heartbeats/<role>_<instance>.heartbeat`
+- The supervisor checks PID liveness and heartbeat age every `heartbeat_interval` seconds
+- On failure: increments a per-agent restart counter; waits `restart_backoff` seconds then re-spawns
+- After `max_restart_count` consecutive failures: records an escalation row in `supervisor_log.md` and fires a notification
+- Shuts down all agents gracefully on `Ctrl-C` (SIGTERM → 10 s wait → SIGKILL)
+
+```bash
+./scripts/supervisor.sh          # spawn all roles + monitor loop
+./scripts/supervisor.sh --once   # spawn only, exit immediately (agents run independently)
+```
+
+Supervisor config lives in `orchestration.toml`:
+
+```toml
+[supervisor]
+heartbeat_interval = 30   # seconds between health checks
+max_restart_count  = 3    # consecutive failures before giving up
+restart_backoff    = 60   # seconds to wait between restarts
+notify             = true
+```
+
+### Notifications
+
+Every meaningful agent event fires through `notify_external()` — a single call-point that delivers both desktop notifications and Slack messages.
+
+**Event types and where they fire:**
+
+| Event | Fired in | Meaning |
+|-------|----------|---------|
+| `task_in_review` | `lifecycle_implementer` | Task submitted for review |
+| `task_committed` | `lifecycle_implementer` | Task committed and Done |
+| `review_submitted` | `lifecycle_reviewer` | Reviewer requested changes |
+| `review_approved` | `lifecycle_reviewer` | Reviewer approved |
+| `phase_merged` | `ensure_phases_merged` | Prior phase merged into main |
+| `phase_merge_needed` | `ensure_phases_merged` | Merge conflict — manual resolution needed |
+| `agent_failed` | `supervisor.sh` | Agent exceeded max restarts |
+| `all_tasks_done` | `supervisor.sh` | All agents completed |
+
+Desktop notifications use `osascript` (macOS) or `notify-send` (Linux). Slack is optional — see [Slack Setup](#slack-setup) below.
+
+### Slack Setup
+
+Slack notifications are **opt-in** and never block or fail a running agent.
+
+#### 1. Create a Slack app
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch**
+2. Name it (e.g. `Stallions Orchestrator`) and pick your workspace
+
+#### 2. Grant bot token scopes
+
+Under **OAuth & Permissions → Scopes → Bot Token Scopes**, add:
+
+| Scope | Why |
+|-------|-----|
+| `chat:write` | Post messages to channels the bot is a member of |
+| `chat:write.public` | Post to any public channel without joining |
+
+#### 3. Install to workspace
+
+Click **Install to Workspace** → copy the **Bot User OAuth Token** (starts with `xoxb-`).
+
+> **Never commit this token.** Export it as an environment variable only.
+
+#### 4. Get channel IDs
+
+For each channel you want notifications sent to, right-click the channel name in Slack → **Copy link** → the ID is the last path segment (e.g. `C0XXXXXXX`).
+
+Alternatively: open the channel in a browser — the URL ends in `/CXXXXXXXX`.
+
+#### 5. Configure orchestration.toml
+
+```toml
+[notifications]
+enabled = true   # flip this to activate
+
+[notifications.slack]
+bot_token_env   = "SLACK_BOT_TOKEN"   # env var name — never put the token here
+default_channel = "C0GENERAL123"      # fallback for unrouted events
+username        = "Orchestrator"
+icon_emoji      = ":robot_face:"
+thread_per_task = true                # group all events for a task into one thread
+
+[notifications.slack.channels]
+task_in_review    = "C0DEV000001"   # #dev-progress
+task_committed    = "C0DEV000001"
+review_submitted  = "C0DEV000001"
+review_approved   = "C0DEV000001"
+phase_merged      = "C0OPS000001"   # #ops-alerts
+phase_merge_needed = "C0OPS000001"
+agent_failed      = "C0OPS000001"
+all_tasks_done    = "C0DEV000001"
+```
+
+Leave any channel empty (`""`) to use `default_channel` for that event type.
+
+#### 6. Export the token and enable
+
+```bash
+export SLACK_BOT_TOKEN="xoxb-your-token-here"
+export SLACK_ENABLED="true"
+
+# Then launch agents as normal
+./scripts/supervisor.sh
+```
+
+`SLACK_ENABLED` is checked at notification time. If it is unset or `false`, all Slack calls are skipped silently — no impact on agent behaviour.
+
+#### 7. Thread grouping
+
+When `thread_per_task = true`, the first Slack message for a task creates a thread. All subsequent events for the same task reply in that thread. Thread timestamps are stored in `$SIGNAL_DIR/slack_threads/<task_id>.ts` (default: `/tmp/claude-agents/slack_threads/`).
+
+To use a persistent signal dir across runs:
+
+```bash
+export SIGNAL_DIR="$HOME/.stallions/signals"
+```
+
+#### Troubleshooting
+
+| Symptom | Likely cause |
+|---------|-------------|
+| No messages appearing | `SLACK_ENABLED` not set to `"true"` |
+| `not_in_channel` error in logs | Bot not invited to the channel — `/invite @YourBotName` in Slack |
+| `invalid_auth` | Token expired or wrong scope — regenerate in the Slack app dashboard |
+| Messages going to wrong channel | Check `[notifications.slack.channels]` key names match exactly |
+| No threading | `thread_per_task = false` or `SIGNAL_DIR` changed between runs (old `.ts` files lost) |
 
 ### Provider-Agnostic Design
 
@@ -265,7 +389,7 @@ your-project/
 │   ├── run_qa_responder.sh     # v2 shim → run_agent.sh --role qa
 │   ├── supervisor.sh           # Spawns & monitors all agents from orchestration.toml
 │   ├── setup.sh                # One-time project initialization
-│   └── status.sh               # Progress dashboard (zero tokens)
+│   └── status.sh               # Progress dashboard: overall + per-role breakdown (zero tokens)
 ├── hooks/                      # Optional lifecycle hooks (user-provided)
 │   ├── backend/
 │   │   ├── pre_invoke.sh
@@ -276,6 +400,7 @@ your-project/
 │   ├── orchestrator.jsonl      # All-agent combined invocation log
 │   ├── agents/                 # Per-instance logs
 │   └── responses/              # Full agent output (when capture_responses = true)
+├── supervisor_log.md           # Escalation records (created when an agent exceeds max restarts)
 ├── AGENT_LOG.md                # Created by Architect
 ├── IMPLEMENTATION_PLAN.md      # Created by Architect
 └── tasks/                      # Created by Architect
@@ -293,11 +418,12 @@ All settings have `orchestration.toml` equivalents. Env vars are useful for one-
 | `AGENT_MAX_TURNS` | 25 | Max tool-use turns per invocation |
 | `AGENT_EFFORT` | (unset) | Effort level (reviewer defaults to "high") |
 | `PROMPTS_DIR` | ./prompts | Path to agent prompt files |
-| `SIGNAL_DIR` | /tmp/claude-agents | Directory for heartbeats and mailboxes |
-| `LOG_LEVEL` | standard | minimal \| standard \| verbose |
-| `CAPTURE_RESPONSES` | true | Save full agent output to logs/responses/ |
-| `NOTIFY` | 1 | Set to 0 to disable desktop notifications |
-| `SLACK_BOT_TOKEN` | (unset) | Slack bot token for remote notifications |
+| `SIGNAL_DIR` | /tmp/claude-agents | Directory for heartbeats, Slack threads, locks, mailboxes |
+| `LOG_LEVEL` | standard | `minimal` \| `standard` \| `verbose` |
+| `CAPTURE_RESPONSES` | true | Save full agent output to `logs/responses/` |
+| `NOTIFY` | 1 | Set to `0` to disable desktop/terminal notifications |
+| `SLACK_ENABLED` | false | Set to `"true"` to activate Slack notifications |
+| `SLACK_BOT_TOKEN` | (unset) | Slack bot OAuth token (`xoxb-…`) — never commit this |
 
 ## v2 → v3 Migration
 

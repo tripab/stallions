@@ -31,6 +31,20 @@ GITIGNORE="$PROJECT_ROOT/.gitignore"
 touch "$GITIGNORE"
 grep -qxF '.worktrees/' "$GITIGNORE" 2>/dev/null || echo '.worktrees/' >> "$GITIGNORE"
 
+# Copy orchestration.toml template if not already present
+TOML_TEMPLATE="$SCRIPT_DIR/../orchestration.toml"
+TOML_TARGET="$PROJECT_ROOT/orchestration.toml"
+if [ ! -f "$TOML_TARGET" ]; then
+  if [ -f "$TOML_TEMPLATE" ]; then
+    cp "$TOML_TEMPLATE" "$TOML_TARGET"
+    echo -e "${GREEN}Created orchestration.toml from template.${RESET}"
+  else
+    echo -e "${RED}Warning: orchestration.toml template not found at $TOML_TEMPLATE${RESET}"
+  fi
+else
+  echo -e "${CYAN}orchestration.toml already exists — skipping copy.${RESET}"
+fi
+
 # Make scripts and providers executable
 chmod +x "$PROJECT_ROOT/scripts/"*.sh 2>/dev/null || true
 chmod +x "$PROJECT_ROOT/providers/"*.sh 2>/dev/null || true
@@ -41,6 +55,9 @@ echo ""
 echo "Next steps:"
 echo "  1. Edit orchestration.toml to configure your project topology."
 echo "     (Or skip — defaults work for single-implementer projects.)"
+echo ""
+echo "     ⚠️  Slack notifications: set enabled=true in [notifications] and export"
+echo "     SLACK_BOT_TOKEN=xoxb-your-token before running agents."
 echo ""
 echo "  2. Open the Architect agent interactively:"
 echo "     claude --prompt-file prompts/architect.md"

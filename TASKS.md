@@ -197,8 +197,8 @@ Write the QA/design-question-answering prompt, consolidating the inline prompt f
 | P3-T5 | Implement `notify_slack()` in common.sh | 3 | Done |
 | P3-T6 | Implement `notify_external()` abstraction in common.sh | 3 | Done |
 | P3-T7 | Add Slack event hook points in run_agent.sh and supervisor.sh | 3 | Done |
-| P3-T8 | Update setup.sh — generate orchestration.toml template | 3 | Not Started |
-| P3-T9 | Update status.sh — per-role progress | 3 | Not Started |
+| P3-T8 | Update setup.sh — generate orchestration.toml template | 3 | Done |
+| P3-T9 | Update status.sh — per-role progress | 3 | Done |
 | P4-T1 | Mailbox functions in common.sh | 4 | Not Started |
 | P4-T2 | Task locking — `claim_task()` and `release_task()` | 4 | Not Started |
 | P4-T3 | Integrate task locking into lifecycle_implementer() | 4 | Not Started |

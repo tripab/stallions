@@ -203,7 +203,7 @@ Write the QA/design-question-answering prompt, consolidating the inline prompt f
 | P4-T2 | Task locking — `claim_task()` and `release_task()` | 4 | Done |
 | P4-T3 | Integrate task locking into lifecycle_implementer() | 4 | Done |
 | P4-T4 | Mailbox-driven reviewer notification | 4 | Done |
-| P4-T5 | Create prompts/backend.md | 4 | Not Started |
+| P4-T5 | Create prompts/backend.md | 4 | Done |
 | P4-T6 | Create prompts/frontend.md | 4 | Not Started |
 | P4-T7 | Create prompts/tester.md | 4 | Not Started |
 | P4-T8 | Create prompts/devops.md | 4 | Not Started |

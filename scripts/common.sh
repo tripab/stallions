@@ -21,6 +21,14 @@ ORCHESTRATION_TOML="${PROJECT_ROOT}/orchestration.toml"
 LOG_LEVEL="${LOG_LEVEL:-standard}"          # minimal | standard | verbose
 CAPTURE_RESPONSES="${CAPTURE_RESPONSES:-true}"
 
+# Usage-limit resilience: when the provider hits a 5h/weekly cap, wait and
+# retry at intervals instead of dying. All values overridable via env or TOML.
+USAGE_LIMIT_ENABLED="${USAGE_LIMIT_ENABLED:-true}"
+USAGE_LIMIT_CHECK_INTERVAL="${USAGE_LIMIT_CHECK_INTERVAL:-900}"   # 15 minutes
+USAGE_LIMIT_MAX_WAIT="${USAGE_LIMIT_MAX_WAIT:-0}"                 # 0 = wait indefinitely
+# Case-insensitive ERE matched against captured agent output to detect a cap.
+USAGE_LIMIT_PATTERNS="${USAGE_LIMIT_PATTERNS:-usage limit reached|usage limit will reset|reached your usage limit|5-hour limit|5 hour limit|weekly limit reached|rate_limit_error|rate limit reached|quota exceeded|too many requests|overloaded_error|limit will reset}"
+
 # Load project config from orchestration.toml (via tomlq) or .env fallback.
 # Safe to call when no config file exists — just keeps the built-in defaults.
 load_config() {
@@ -52,6 +60,18 @@ _load_toml_config() {
 
   v=$(tomlq -r '.logging.capture_responses // empty' "$t" 2>/dev/null)
   [ -n "$v" ] && CAPTURE_RESPONSES="$v"
+
+  v=$(tomlq -r '.usage_limit.enabled // empty' "$t" 2>/dev/null)
+  [ -n "$v" ] && USAGE_LIMIT_ENABLED="$v"
+
+  v=$(tomlq -r '.usage_limit.check_interval // empty' "$t" 2>/dev/null)
+  [ -n "$v" ] && USAGE_LIMIT_CHECK_INTERVAL="$v"
+
+  v=$(tomlq -r '.usage_limit.max_wait // empty' "$t" 2>/dev/null)
+  [ -n "$v" ] && USAGE_LIMIT_MAX_WAIT="$v"
+
+  v=$(tomlq -r '.usage_limit.patterns // empty' "$t" 2>/dev/null)
+  [ -n "$v" ] && USAGE_LIMIT_PATTERNS="$v"
 }
 
 # Get a config value for a role, falling back to [defaults].
@@ -922,6 +942,35 @@ _write_heartbeat() {
   date -u +%s > "$SIGNAL_DIR/heartbeats/${role}_${instance}.heartbeat"
 }
 
+# ── Usage-limit resilience ───────────────────────────────────────────────────
+
+# Detect whether an agent invocation was cut short by a provider usage cap
+# (5-hour / weekly subscription limit or API rate limit) rather than finishing.
+# Usage: is_usage_limited <output_file>  → exit 0 if a limit signature is found.
+is_usage_limited() {
+  local output_file="$1"
+  [ "${USAGE_LIMIT_ENABLED:-true}" = "true" ] || return 1
+  [ -f "$output_file" ] || return 1
+  grep -qiE "$USAGE_LIMIT_PATTERNS" "$output_file" 2>/dev/null
+}
+
+# Sleep for N seconds while periodically refreshing the heartbeat, so a long
+# usage-limit wait does not exceed the supervisor's stale-heartbeat threshold
+# (3× heartbeat_interval) and trigger an unwanted re-spawn.
+# Usage: _sleep_with_heartbeat <seconds>
+_sleep_with_heartbeat() {
+  local total="$1"
+  local chunk=15 waited=0 nap
+  while [ "$waited" -lt "$total" ]; do
+    _write_heartbeat
+    nap=$(( total - waited ))
+    [ "$nap" -gt "$chunk" ] && nap=$chunk
+    sleep "$nap"
+    waited=$(( waited + nap ))
+  done
+  _write_heartbeat
+}
+
 # ── Hook execution ───────────────────────────────────────────────────────────
 
 # Run a lifecycle hook script if it exists.
@@ -1011,19 +1060,48 @@ invoke_agent_logged() {
   prompt_bytes=$(wc -c < "$prompt_file" | tr -d ' ')
   prompt_hash="sha256:$(shasum -a 256 "$prompt_file" 2>/dev/null | awk '{print $1}' || echo "unknown")"
 
-  # Response capture
+  # Response capture (with usage-limit retry).
+  # We always tee to response_tmp — even in minimal mode — so the usage-limit
+  # detector can inspect the output. Minimal mode still skips the token/summary
+  # parsing and full-response capture below.
   local response_tmp exit_code=0
   response_tmp=$(mktemp)
 
-  if [ "$LOG_LEVEL" = "minimal" ]; then
-    invoke_coding_agent < "$prompt_file" || exit_code=$?
-  else
-    # Temporarily disable pipefail so we can capture PIPESTATUS
+  local total_waited=0
+  while true; do
+    : > "$response_tmp"
+    # Temporarily disable pipefail so we can capture PIPESTATUS through tee
     set +eo pipefail
     invoke_coding_agent < "$prompt_file" | tee "$response_tmp"
     exit_code=${PIPESTATUS[0]}
     set -eo pipefail
-  fi
+
+    # If the provider hit a 5h/weekly usage cap, wait for the session to renew
+    # and retry instead of letting the agent die. The re-invocation IS the
+    # renewal check: while still capped it fails fast and we wait another
+    # interval; once renewed the call proceeds normally.
+    if is_usage_limited "$response_tmp"; then
+      local interval="${USAGE_LIMIT_CHECK_INTERVAL:-900}"
+      local max_wait="${USAGE_LIMIT_MAX_WAIT:-0}"
+      if [ "$max_wait" -gt 0 ] && [ "$total_waited" -ge "$max_wait" ]; then
+        log_err "Usage limit still active after ${total_waited}s (max_wait ${max_wait}s). Giving up on ${task_id:-invocation}."
+        notify_external "usage_limit_giveup" "${role} gave up on ${task_id:-invocation} after waiting ${total_waited}s on usage limit" "danger" "$task_id"
+        break
+      fi
+      log_wait "Usage limit reached. Waiting ${interval}s for session renewal, then retrying ${task_id:-invocation}..."
+      notify_external "usage_limit_paused" "${role} paused — usage limit hit; retrying in ${interval}s" "warning" "$task_id"
+      _sleep_with_heartbeat "$interval"
+      total_waited=$(( total_waited + interval ))
+      continue
+    fi
+
+    # Not limited — the call ran to completion (success or a real error).
+    if [ "$total_waited" -gt 0 ]; then
+      log_ok "Usage limit cleared after ${total_waited}s — ${role} resuming."
+      notify_external "usage_limit_resumed" "${role} resumed after usage limit (waited ${total_waited}s)" "good" "$task_id"
+    fi
+    break
+  done
 
   local end_ts duration_seconds
   end_ts=$(date -u +%s)

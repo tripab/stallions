@@ -171,6 +171,19 @@ Write the QA/design-question-answering prompt, consolidating the inline prompt f
 
 ---
 
+## Phase 5: Usage-Limit Resilience
+
+### P5-T1: Usage-limit config in common.sh and orchestration.toml
+Add a `[usage_limit]` section to `orchestration.toml` with `enabled` (default `true`), `check_interval` (default `900` seconds = 15 min), `max_wait` (default `0` = wait indefinitely), and a commented-out optional `patterns` override. In `common.sh`, set built-in defaults (`USAGE_LIMIT_ENABLED`, `USAGE_LIMIT_CHECK_INTERVAL`, `USAGE_LIMIT_MAX_WAIT`, `USAGE_LIMIT_PATTERNS`) near the other config vars and parse the new keys in `_load_toml_config()`. All values must be overridable via environment variables.
+
+### P5-T2: Implement `is_usage_limited()` and `_sleep_with_heartbeat()` in common.sh
+Add `is_usage_limited(output_file)` that returns 0 when the captured agent output matches the usage-limit regex (`USAGE_LIMIT_PATTERNS`, case-insensitive) and the feature is enabled. Add `_sleep_with_heartbeat(seconds)` that sleeps in small increments while refreshing the heartbeat file, so a long wait does not trip the supervisor's stale-heartbeat threshold (3× `heartbeat_interval`).
+
+### P5-T3: Wire usage-limit retry into `invoke_agent_logged()`
+Wrap the provider invocation in `invoke_agent_logged()` in a retry loop. Always tee output to a temp file (even in `minimal` mode) so the limit detector can inspect it. When `is_usage_limited` is true: log a wait, fire a `usage_limit_paused` notification, `_sleep_with_heartbeat "$check_interval"`, then re-invoke. Respect `max_wait` (give up and fire `usage_limit_giveup` when exceeded). On the first successful call after any wait, fire `usage_limit_resumed`. All roles (implementer, reviewer, qa) inherit this behaviour because they share this choke point.
+
+---
+
 ## Progress Tracker
 
 | Task ID | Description | Phase | Status |
@@ -208,3 +221,6 @@ Write the QA/design-question-answering prompt, consolidating the inline prompt f
 | P4-T7 | Create prompts/tester.md | 4 | Done |
 | P4-T8 | Create prompts/devops.md | 4 | Done |
 | P4-T9 | Create prompts/qa.md | 4 | Not Started |
+| P5-T1 | Usage-limit config in common.sh and orchestration.toml | 5 | Done |
+| P5-T2 | Implement `is_usage_limited()` and `_sleep_with_heartbeat()` | 5 | Done |
+| P5-T3 | Wire usage-limit retry into `invoke_agent_logged()` | 5 | Done |

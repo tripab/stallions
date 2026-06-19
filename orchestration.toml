@@ -28,6 +28,18 @@ max_restart_count  = 3     # per-agent consecutive failures before giving up
 restart_backoff    = 60    # seconds to wait between restarts
 notify             = true
 
+# ── Usage limits ─────────────────────────────────────────────────────────────
+# Subscription agents (Claude, Codex, …) enforce rolling 5-hour and weekly
+# caps. When an agent hits one mid-run, it waits and retries at check_interval
+# instead of dying — so overnight runs resume automatically once the session
+# renews. Set enabled = false to fail fast (old behaviour).
+
+[usage_limit]
+enabled        = true
+check_interval = 900     # seconds between renewal attempts (default 15 min)
+max_wait       = 0       # cap on total wait per invocation; 0 = wait indefinitely
+# patterns     = "usage limit reached|limit will reset|rate_limit_error"  # ERE override
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 [logging]

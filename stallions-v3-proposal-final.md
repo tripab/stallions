@@ -408,6 +408,28 @@ prompts/
 
 Users customize these for their project. The templates are starting points.
 
+### 5.10 Usage-Limit Resilience
+
+Subscription-based coding agents (Claude, Codex, etc.) enforce rolling **5-hour** and **weekly** usage caps. When an agent hits one mid-run, the provider CLI exits with an error. In v2 this surfaced as a generic agent failure: the loop logged an error, slept 30s, and retried — burning restart counters and, after `max_restart_count`, escalating the agent as permanently failed. An overnight run could therefore die a few minutes after the cap was reached and never recover, even though the session would have renewed on its own.
+
+v3 makes every invocation **usage-limit aware**. The single choke point through which all roles invoke their provider (`invoke_agent_logged` in `common.sh`) inspects the captured output for usage-limit signatures. When one is detected, instead of returning the error to the lifecycle, it:
+
+1. Logs a `⏳` wait and fires a `usage_limit_paused` notification.
+2. Sleeps for `check_interval` seconds (default **15 minutes**, configurable).
+3. Re-invokes the same prompt — the re-invocation *is* the renewal check: if the cap is still active the provider fails fast and the agent waits another interval; once the session renews, the call proceeds normally and a `usage_limit_resumed` notification fires.
+
+Because the wait can be far longer than the supervisor's stale-heartbeat threshold (3× `heartbeat_interval`, default 90s), the wait keeps the agent's heartbeat fresh in small increments so the supervisor does not mistake a throttled agent for a stuck one and re-spawn it.
+
+```toml
+[usage_limit]
+enabled        = true   # set false to fail fast on limits (old v2 behaviour)
+check_interval = 900     # seconds between renewal attempts (default 15 min)
+max_wait       = 0       # cap on total wait per invocation; 0 = wait indefinitely
+# patterns     = "..."   # optional override of the detection regex (ERE, case-insensitive)
+```
+
+Detection is regex-based and matches provider phrasings such as *"usage limit reached"*, *"limit will reset"*, *"5-hour limit"*, *"weekly limit reached"*, `rate_limit_error`, and `overloaded_error`. The pattern set is configurable so new providers or error wordings can be added without code changes. The feature is provider-agnostic — it works for any agent whose CLI prints a recognizable limit message before exiting.
+
 ---
 
 ## 6. Detailed Design: Logging

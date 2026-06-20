@@ -733,7 +733,7 @@ The dashboard lives in its **own repository** (`racetrack`), installable via `np
 
 #### 8.3.1 Architect Terminal (Tab 1)
 
-A full terminal emulator running the Architect agent's interactive session. An xterm.js instance connected via WebSocket to a `node-pty` process on the sidecar. The sidecar spawns `claude --prompt-file prompts/architect.md` (or whatever provider is configured) and pipes stdin/stdout through the PTY.
+A full terminal emulator running the Architect agent's interactive session. An xterm.js instance connected via WebSocket to a `node-pty` process on the sidecar. The sidecar spawns `claude --system-prompt-file prompts/architect.md` (or whatever provider is configured) and pipes stdin/stdout through the PTY.
 
 **Why a terminal and not a chat UI:** A terminal works with *any* CLI agent — Claude Code, Codex, Aider, OpenCode — because it's just a PTY. Building a chat UI would lock us into one provider's API. The agent's native markdown rendering, thinking indicators, and tool-use output all appear exactly as intended.
 

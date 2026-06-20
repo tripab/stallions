@@ -72,6 +72,11 @@ _load_toml_config() {
 
   v=$(tomlq -r '.usage_limit.patterns // empty' "$t" 2>/dev/null)
   [ -n "$v" ] && USAGE_LIMIT_PATTERNS="$v"
+
+  # Always return success: a trailing `[ -n "$v" ] && ...` that evaluates false
+  # would otherwise make this function (and load_config) return non-zero, which
+  # under `set -e` silently kills any caller that invokes load_config bare.
+  return 0
 }
 
 # Get a config value for a role, falling back to [defaults].

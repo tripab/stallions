@@ -77,7 +77,7 @@ if [ -z "$EXPLICIT_PROVIDER" ] && [ -n "$ROLE_PROVIDER" ]; then
 fi
 
 # Resolve hooks dir (relative to project root)
-local HOOKS_DIR_ABS=""
+HOOKS_DIR_ABS=""
 if [ -n "$ROLE_HOOKS_DIR" ]; then
   HOOKS_DIR_ABS="$PROJECT_ROOT/$ROLE_HOOKS_DIR"
 fi
@@ -116,7 +116,7 @@ case "$ROLE_TYPE" in
     ;;
   interactive)
     log_info "Role '$ROLE' is type=interactive — launch it manually or via the dashboard."
-    log_info "  claude --prompt-file $ROLE_PROMPT"
+    log_info "  claude --system-prompt-file $ROLE_PROMPT"
     exit 0
     ;;
   *)

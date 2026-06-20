@@ -18,7 +18,11 @@ cd /path/to/your/project
 #    Skip this step for single-implementer projects — defaults work as-is.
 
 # 4. Run the Architect interactively
-claude --prompt-file prompts/architect.md
+#    Start from a problem statement (Architect drafts the plan), or pass an
+#    existing implementation plan as an argument to skip straight to file creation:
+claude --system-prompt-file prompts/architect.md
+#    or, with a plan already written:
+#    claude --system-prompt-file prompts/architect.md "Use the plan in IMPLEMENTATION_PLAN.md"
 
 # 5. After the Architect creates AGENT_LOG.md and tasks/, launch workers
 #    Option A — supervisor (spawns all roles from orchestration.toml)

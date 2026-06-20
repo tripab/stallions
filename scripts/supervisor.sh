@@ -34,14 +34,32 @@ RUN_AGENT="$SCRIPT_DIR/run_agent.sh"
 
 # ── Process tracking ─────────────────────────────────────────────────────────
 
-# Associative arrays: key = "<role>_<instance>"
-declare -A AGENT_PIDS=()       # PID of each running agent process
-declare -A AGENT_RESTART=()    # consecutive restart count per agent
-declare -A AGENT_ROLES=()      # role name for each key (for re-spawn)
+# macOS ships bash 3.2, which has no associative arrays. We track agents with
+# parallel indexed arrays instead. Each agent occupies one index across all
+# arrays; an escalated agent is "tombstoned" (its key blanked) and ACTIVE_AGENTS
+# decremented, so we never shrink the arrays mid-iteration.
+AGENT_KEYS=()        # "<role>_<instance>" (blanked when tombstoned)
+AGENT_PIDS=()        # PID of each running agent process
+AGENT_RESTART=()     # consecutive restart count per agent
+AGENT_ROLES=()       # role name (for re-spawn)
+AGENT_INSTANCES=()   # instance number (for re-spawn)
+ACTIVE_AGENTS=0      # count of non-tombstoned agents
+
+# Find the array index for a given agent key. Prints the index, or -1 if absent.
+# Usage: _agent_index <key>
+_agent_index() {
+  local key="$1" i
+  for i in "${!AGENT_KEYS[@]}"; do
+    [ "${AGENT_KEYS[$i]}" = "$key" ] && { echo "$i"; return; }
+  done
+  echo -1
+}
 
 # ── Spawn helpers ────────────────────────────────────────────────────────────
 
 # Spawn a single agent instance in the background.
+# On first spawn the agent is appended; on re-spawn its existing slot's PID is
+# updated in place (keyed by "<role>_<instance>").
 # Usage: spawn_agent <role> <instance>
 spawn_agent() {
   local role="$1"
@@ -51,8 +69,20 @@ spawn_agent() {
   log_info "Spawning agent: role=$role instance=$instance"
   bash "$RUN_AGENT" --role "$role" --instance "$instance" &
   local pid=$!
-  AGENT_PIDS["$key"]=$pid
-  AGENT_ROLES["$key"]=$role
+
+  local idx
+  idx=$(_agent_index "$key")
+  if [ "$idx" -ge 0 ]; then
+    AGENT_PIDS[$idx]=$pid           # re-spawn: reuse the slot
+  else
+    idx=${#AGENT_KEYS[@]}           # new agent: append a slot
+    AGENT_KEYS[$idx]="$key"
+    AGENT_PIDS[$idx]=$pid
+    AGENT_ROLES[$idx]="$role"
+    AGENT_INSTANCES[$idx]="$instance"
+    AGENT_RESTART[$idx]=0
+    ACTIVE_AGENTS=$(( ACTIVE_AGENTS + 1 ))
+  fi
   log_ok "  $key → PID $pid"
 }
 
@@ -107,8 +137,11 @@ _shutdown() {
   log_info "Supervisor caught SIGINT/SIGTERM — initiating graceful shutdown..."
 
   local pids_to_kill=()
-  for key in "${!AGENT_PIDS[@]}"; do
-    local pid="${AGENT_PIDS[$key]}"
+  local i
+  for i in "${!AGENT_KEYS[@]}"; do
+    local key="${AGENT_KEYS[$i]}"
+    [ -z "$key" ] && continue          # skip tombstoned slots
+    local pid="${AGENT_PIDS[$i]}"
     if kill -0 "$pid" 2>/dev/null; then
       pids_to_kill+=("$pid")
       log_info "Sending SIGTERM to $key (PID $pid)..."
@@ -149,7 +182,9 @@ trap _shutdown SIGINT SIGTERM
 
 _heartbeat_age() {
   local hb_file="$1"
-  [ -f "$hb_file" ] || echo 999999
+  # No heartbeat yet → treat as very stale. Must return, or the function would
+  # also print the line below and the caller's numeric test would break.
+  [ -f "$hb_file" ] || { echo 999999; return; }
   local now last_beat
   now=$(date +%s)
   last_beat=$(cat "$hb_file" 2>/dev/null || echo 0)
@@ -162,14 +197,15 @@ monitor_loop() {
   while true; do
     sleep "$HEARTBEAT_INTERVAL"
 
-    local all_done=true
-
-    for key in "${!AGENT_PIDS[@]}"; do
-      local pid="${AGENT_PIDS[$key]}"
-      local role="${AGENT_ROLES[$key]}"
-      local instance="${key#${role}_}"
+    local i
+    for i in "${!AGENT_KEYS[@]}"; do
+      local key="${AGENT_KEYS[$i]}"
+      [ -z "$key" ] && continue          # skip tombstoned slots
+      local pid="${AGENT_PIDS[$i]}"
+      local role="${AGENT_ROLES[$i]}"
+      local instance="${AGENT_INSTANCES[$i]}"
       local hb_file="$SIGNAL_DIR/heartbeats/${key}.heartbeat"
-      local restart_count="${AGENT_RESTART[$key]:-0}"
+      local restart_count="${AGENT_RESTART[$i]:-0}"
 
       local alive=true
       kill -0 "$pid" 2>/dev/null || alive=false
@@ -180,12 +216,10 @@ monitor_loop() {
       [ "$hb_age" -gt "$stale_threshold" ] && stuck=true
 
       if [ "$alive" = true ] && [ "$stuck" = false ]; then
-        all_done=false
         continue
       fi
 
       # Agent is dead or stuck
-      all_done=false
       local reason
       if [ "$alive" = false ]; then
         reason="process exited (PID $pid no longer alive)"
@@ -197,10 +231,10 @@ monitor_loop() {
         log_err "$key has exceeded max restarts ($MAX_RESTART_COUNT). Escalating."
         _record_escalation "$key" "$reason"
         notify_external "agent_failed" "$key failed permanently after $MAX_RESTART_COUNT restarts" "danger"
-        # Remove from tracked set so we don't keep re-escalating
-        unset "AGENT_PIDS[$key]"
-        unset "AGENT_ROLES[$key]"
-        unset "AGENT_RESTART[$key]"
+        # Tombstone the slot so we don't keep re-escalating it
+        AGENT_KEYS[$i]=""
+        AGENT_PIDS[$i]=""
+        ACTIVE_AGENTS=$(( ACTIVE_AGENTS - 1 ))
         continue
       fi
 
@@ -208,12 +242,12 @@ monitor_loop() {
       log_info "Waiting ${RESTART_BACKOFF}s before re-spawning $key..."
       sleep "$RESTART_BACKOFF"
 
-      AGENT_RESTART["$key"]=$(( restart_count + 1 ))
+      AGENT_RESTART[$i]=$(( restart_count + 1 ))
       spawn_agent "$role" "$instance"
     done
 
-    # Check if all tasks are done (no more agents to track)
-    if [ "${#AGENT_PIDS[@]}" -eq 0 ]; then
+    # Check if all agents have finished (none left to track)
+    if [ "$ACTIVE_AGENTS" -le 0 ]; then
       log_ok "All agents have completed. Supervisor exiting."
       notify_external "all_tasks_done" "All agents finished — project complete" "good"
       exit 0

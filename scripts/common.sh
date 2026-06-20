@@ -566,24 +566,48 @@ read_signal() {
 
 # ── Task locking ─────────────────────────────────────────────────────────────
 
-# Return 0 if the task is currently locked (by any agent), 1 if free.
+# Remove a lock whose owning process is no longer alive (the holder crashed
+# mid-task). This keeps locking self-healing: a crashed agent — including a
+# reviewer that died mid-review — never leaves a task stuck-locked forever.
+# No-op for live owners or pre-existing locks with no recorded PID.
+# Usage: _reclaim_stale_lock <task_id>
+_reclaim_stale_lock() {
+  local lock_dir="$SIGNAL_DIR/locks/${1}.lock"
+  [ -d "$lock_dir" ] || return 0
+  local owner_pid
+  owner_pid=$(cat "${lock_dir}/pid" 2>/dev/null || echo "")
+  [ -n "$owner_pid" ] || return 0          # unknown owner → leave it alone
+  if ! kill -0 "$owner_pid" 2>/dev/null; then
+    log_info "Reclaiming stale lock on $1 (owner PID $owner_pid is gone)."
+    rm -rf "$lock_dir"
+  fi
+}
+
+# Return 0 if the task is currently locked (by a live owner), 1 if free.
+# Self-heals stale locks left by crashed agents before answering.
 # Usage: is_task_locked <task_id>
 is_task_locked() {
-  [ -d "$SIGNAL_DIR/locks/${1}.lock" ]
+  local lock_dir="$SIGNAL_DIR/locks/${1}.lock"
+  [ -d "$lock_dir" ] || return 1
+  _reclaim_stale_lock "$1"
+  [ -d "$lock_dir" ]
 }
 
 
 # Atomically claim a task by creating a lock directory via mkdir.
 # mkdir is atomic on POSIX filesystems — only one caller wins the race.
+# Records the claiming process PID so a crashed holder's lock can be reclaimed.
 # Usage: claim_task <task_id> <role>
-# Returns: 0 on success, 1 if already claimed by another agent.
+# Returns: 0 on success, 1 if already claimed by another (live) agent.
 claim_task() {
   local task_id="$1"
   local role="$2"
   local lock_dir="$SIGNAL_DIR/locks/${task_id}.lock"
   mkdir -p "$SIGNAL_DIR/locks"
+  _reclaim_stale_lock "$task_id"           # clear a dead owner's lock first
   if mkdir "$lock_dir" 2>/dev/null; then
     echo "$role" > "${lock_dir}/owner"
+    echo "$$"    > "${lock_dir}/pid"
     return 0
   fi
   return 1
@@ -1427,10 +1451,22 @@ lifecycle_reviewer() {
       continue
     fi
 
+    # Hold the task lock for the whole review. This closes the review-gate race:
+    # the reviewer's agent sets the status to "Approved" partway through its run,
+    # and without this lock the implementer's crash-recovery path (Priority 1)
+    # could see "Approved" and commit the task to "Done" before the review even
+    # returns. Holding the lock makes that claim_task fail until we release.
+    if ! claim_task "$TASK_ID" "$role"; then
+      log_wait "$TASK_ID is locked by another agent — retrying shortly."
+      sleep 5
+      continue
+    fi
+
     local TASK_CONTENT
     TASK_CONTENT=$(read_task "$TASK_ID")
     if [ -z "$TASK_CONTENT" ]; then
       log_err "Task file not found: tasks/$TASK_ID.md"
+      release_task "$TASK_ID"
       sleep 10
       continue
     fi
@@ -1491,6 +1527,9 @@ lifecycle_reviewer() {
         ;;
     esac
 
+    # Review finished and the status is final — release so the implementer can
+    # commit an Approved task, or pick up a Reviewed one for fixups.
+    release_task "$TASK_ID"
     sleep 5
   done
 }
@@ -1583,7 +1622,11 @@ lifecycle_qa_responder() {
 # ── Graceful shutdown ───────────────────────────────────────────────────────
 
 _cleanup() {
+  trap - SIGINT SIGTERM        # disarm so a second signal can't re-enter
   log_info "Caught interrupt, shutting down..."
+  # Terminate any in-flight child (e.g. a running coding-agent invocation) so it
+  # doesn't outlive this agent as an orphan. Harmless if there are none.
+  pkill -P $$ 2>/dev/null || true
   exit 0
 }
 trap _cleanup SIGINT SIGTERM

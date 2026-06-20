@@ -342,7 +342,7 @@ The supervisor is the only new long-running process. It replaces the "open N ter
 
 3. **Re-spawn on failure**: If an agent process exits or is stuck, the supervisor kills it (if still running), waits `restart_backoff` seconds, and re-launches. After `max_restart_count` consecutive failures, it stops trying and notifies the user.
 
-4. **Graceful shutdown**: `Ctrl-C` sends `SIGTERM` to all child agents, waits up to 10 seconds, then `SIGKILL`.
+4. **Graceful shutdown**: The supervisor runs with job control (`set -m`) so each agent leads its own process group. `Ctrl-C` therefore reaches only the supervisor, which then `SIGTERM`s each agent's **whole process group** — taking the agent *and* its in-flight coding-agent child down together — waits up to 10 seconds, `SIGKILL`s any survivors, and `wait`s to reap them so nothing is left orphaned.
 
 5. **Progress reporting**: Periodically prints a compact status line showing per-agent activity and overall progress.
 
@@ -385,6 +385,8 @@ claim_task() {
 ```
 
 `mkdir` is atomic on all POSIX filesystems — exactly one process wins.
+
+The **reviewer also holds the lock for the duration of a review**. This closes a review-gate race: the reviewer's agent flips the task to `Approved` partway through its run, and without the lock the implementer's crash-recovery path could see `Approved` and commit the task to `Done` before the review even returns. Each lock records the holder's PID, so a lock left behind by a crashed agent (reviewer or implementer) is automatically reclaimed when its owner process is no longer alive — locking stays self-healing and never deadlocks a task.
 
 ### 5.8 Updated Architect Prompt
 

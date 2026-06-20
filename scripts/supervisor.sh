@@ -7,6 +7,16 @@
 
 set -euo pipefail
 
+# Enable job control so every backgrounded agent becomes the leader of its own
+# process group. This gives the supervisor two things on shutdown:
+#   1. Ctrl-C (SIGINT to the foreground group) reaches ONLY the supervisor, not
+#      the agents — so the supervisor is the sole, orderly signal handler.
+#   2. `kill -<sig> -<pid>` signals the agent AND its descendants (e.g. an
+#      in-flight coding-agent invocation) as one group, so nothing is orphaned.
+# Job-control notifications ("[1] Done") are not printed for non-interactive
+# scripts, so this adds no output noise.
+set -m
+
 source "$(dirname "$0")/common.sh"
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
@@ -132,10 +142,18 @@ spawn_all() {
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 
+# Send a signal to an agent's whole process group, falling back to the bare PID
+# if the group send fails. Usage: _signal_group <signal> <pid>
+_signal_group() {
+  local sig="$1" pid="$2"
+  kill "-${sig}" "-${pid}" 2>/dev/null || kill "-${sig}" "$pid" 2>/dev/null || true
+}
+
 _shutdown() {
   echo ""
   log_info "Supervisor caught SIGINT/SIGTERM — initiating graceful shutdown..."
 
+  # SIGTERM each live agent's process group (agent + any coding-agent child).
   local pids_to_kill=()
   local i
   for i in "${!AGENT_KEYS[@]}"; do
@@ -144,33 +162,42 @@ _shutdown() {
     local pid="${AGENT_PIDS[$i]}"
     if kill -0 "$pid" 2>/dev/null; then
       pids_to_kill+=("$pid")
-      log_info "Sending SIGTERM to $key (PID $pid)..."
-      kill -TERM "$pid" 2>/dev/null || true
+      log_info "Sending SIGTERM to $key (PID $pid) and its children..."
+      _signal_group TERM "$pid"
     fi
   done
 
-  if [ "${#pids_to_kill[@]}" -gt 0 ]; then
-    log_info "Waiting up to 10s for agents to exit..."
-    local deadline=$(( $(date +%s) + 10 ))
-    for pid in "${pids_to_kill[@]}"; do
-      local remaining=$(( deadline - $(date +%s) ))
-      if [ "$remaining" -le 0 ]; then
-        break
-      fi
-      # Poll until the pid is gone or time runs out
-      while kill -0 "$pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
-        sleep 1
-      done
-    done
-
-    # Force-kill anything still alive
-    for pid in "${pids_to_kill[@]}"; do
-      if kill -0 "$pid" 2>/dev/null; then
-        log_err "PID $pid did not exit — sending SIGKILL."
-        kill -9 "$pid" 2>/dev/null || true
-      fi
-    done
+  if [ "${#pids_to_kill[@]}" -eq 0 ]; then
+    log_ok "Supervisor shutdown complete. No agents were running."
+    exit 0
   fi
+
+  # Wait up to 10s for graceful exit, checking every second.
+  log_info "Waiting up to 10s for ${#pids_to_kill[@]} agent(s) to exit..."
+  local deadline=$(( $(date +%s) + 10 ))
+  local pid
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local still_alive=false
+    for pid in "${pids_to_kill[@]}"; do
+      kill -0 "$pid" 2>/dev/null && still_alive=true
+    done
+    [ "$still_alive" = false ] && break
+    sleep 1
+  done
+
+  # SIGKILL any process group that ignored SIGTERM.
+  for pid in "${pids_to_kill[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      log_err "PID $pid did not exit — sending SIGKILL to its process group."
+      _signal_group KILL "$pid"
+    fi
+  done
+
+  # Reap the children so none linger as zombies and the wait actually blocks
+  # until each has truly terminated.
+  for pid in "${pids_to_kill[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
 
   log_ok "Supervisor shutdown complete. All agents stopped."
   exit 0
@@ -239,6 +266,16 @@ monitor_loop() {
       fi
 
       log_err "$key failed: $reason (restart $((restart_count+1))/$MAX_RESTART_COUNT)"
+
+      # If the old process is still alive (stuck, not exited), terminate its
+      # whole group first so it and any child coding-agent don't linger as
+      # orphans alongside the replacement we're about to spawn.
+      if kill -0 "$pid" 2>/dev/null; then
+        _signal_group TERM "$pid"
+        sleep 2
+        kill -0 "$pid" 2>/dev/null && _signal_group KILL "$pid"
+      fi
+
       log_info "Waiting ${RESTART_BACKOFF}s before re-spawning $key..."
       sleep "$RESTART_BACKOFF"
 

@@ -104,6 +104,12 @@ export AGENT_PROVIDER="${AGENT_PROVIDER:-${ROLE_PROVIDER:-providers/claude.sh}}"
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 
+# Start a lifetime heartbeat pinger so this agent keeps reporting liveness even
+# during long coding-agent invocations or idle poll sleeps — the supervisor's
+# stale-heartbeat check then only trips on a genuinely dead/wedged process, not
+# a busy or waiting one. The _cleanup trap (pkill -P $$) stops it on exit.
+_start_heartbeat_pinger
+
 case "$ROLE_TYPE" in
   implementer)
     lifecycle_implementer

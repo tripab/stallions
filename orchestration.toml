@@ -71,6 +71,9 @@ phase_merge_needed = ""  # #ops-alerts
 phase_merged      = ""
 agent_failed      = ""   # #ops-alerts
 all_tasks_done    = ""
+usage_limit_paused  = ""  # agent paused on a 5h/weekly/session cap
+usage_limit_resumed = ""  # session renewed; agent resumed
+usage_limit_giveup  = ""  # gave up after max_wait on a cap
 
 # ── Agent Role Definitions ────────────────────────────────────────────────────
 # Each role defines: type, prompt, tags, provider override, instances, etc.

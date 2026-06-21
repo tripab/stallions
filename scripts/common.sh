@@ -27,7 +27,11 @@ USAGE_LIMIT_ENABLED="${USAGE_LIMIT_ENABLED:-true}"
 USAGE_LIMIT_CHECK_INTERVAL="${USAGE_LIMIT_CHECK_INTERVAL:-900}"   # 15 minutes
 USAGE_LIMIT_MAX_WAIT="${USAGE_LIMIT_MAX_WAIT:-0}"                 # 0 = wait indefinitely
 # Case-insensitive ERE matched against captured agent output to detect a cap.
-USAGE_LIMIT_PATTERNS="${USAGE_LIMIT_PATTERNS:-usage limit reached|usage limit will reset|reached your usage limit|5-hour limit|5 hour limit|weekly limit reached|rate_limit_error|rate limit reached|quota exceeded|too many requests|overloaded_error|limit will reset}"
+# Must cover Claude Code's real wording — e.g. "You've hit your session limit ·
+# resets 1:40am" and "You've hit your usage limit" — plus weekly/5-hour caps and
+# API rate-limit errors. Kept reasonably anchored to avoid false positives on a
+# task that merely discusses rate limiting.
+USAGE_LIMIT_PATTERNS="${USAGE_LIMIT_PATTERNS:-hit your usage limit|hit your session limit|hit your weekly limit|session limit|usage limit reached|usage limit will reset|reached your usage limit|weekly limit reached|5-hour limit|5 hour limit|rate_limit_error|rate limit reached|quota exceeded|too many requests|overloaded_error|limit will reset}"
 
 # Load project config from orchestration.toml (via tomlq) or .env fallback.
 # Safe to call when no config file exists — just keeps the built-in defaults.
@@ -402,6 +406,38 @@ append_activity_log() {
   local timestamp
   timestamp=$(date '+%Y-%m-%d %H:%M')
   echo "- [$timestamp] $agent: $message" >> "$AGENT_LOG"
+}
+
+# Read a task's Status from its own file's "Status:" header line.
+# Usage: task_file_status "TASK-003" → "In Review"
+task_file_status() {
+  local task_file="$TASKS_DIR/$1.md"
+  [ -f "$task_file" ] || return
+  sed -n 's/^[[:space:]]*Status:[[:space:]]*//p' "$task_file" | head -1 \
+    | sed 's/[[:space:]]*$//'
+}
+
+# Reconcile the AGENT_LOG Task Index status from the task file's Status line.
+# Smaller coding-agent models reliably set the task file's "Status:" line but
+# sometimes fail to edit the AGENT_LOG markdown-table cell (the source of truth).
+# To stay robust we sync the table FROM the task file — but only when the agent
+# left the table untouched (status still == pre-invocation value), so we never
+# revert a table update the agent did make.
+# Usage: reconcile_status_from_taskfile "TASK-003" "<status-before-invocation>"
+reconcile_status_from_taskfile() {
+  local task_id="$1" pre_status="$2"
+  local table_status file_status
+  table_status=$(task_status "$task_id")
+  [ "$table_status" = "$pre_status" ] || return 0     # agent updated the table — trust it
+  file_status=$(task_file_status "$task_id")
+  [ -n "$file_status" ] && [ "$file_status" != "$table_status" ] || return 0
+  case "$file_status" in
+    "Pending"|"In Review"|"Reviewed"|"Approved"|"Done")
+      update_task_status "$task_id" "$file_status"
+      append_activity_log "${AGENT_ROLE:-agent}" "$task_id status synced to $file_status from task file"
+      log_info "Reconciled $task_id AGENT_LOG status → $file_status (agent set it only in the task file)"
+      ;;
+  esac
 }
 
 # ── Phase Transition (merge completed phases forward) ──────────────────────
@@ -936,6 +972,8 @@ load_provider() {
 }
 
 # Default implementation (Claude Code) — used if no provider file is loaded.
+# Mirrors providers/claude.sh: JSON output for exact token usage via the
+# $AGENT_TOKENS_FILE sidecar, readable result text to stdout.
 if ! declare -f invoke_coding_agent &>/dev/null; then
   invoke_coding_agent() {
     local max_turns="${AGENT_MAX_TURNS:-$MAX_TURNS}"
@@ -943,11 +981,25 @@ if ! declare -f invoke_coding_agent &>/dev/null; then
     local model="${AGENT_MODEL:-sonnet}"
     local effort="${AGENT_EFFORT:-}"
 
-    local cmd=(claude --model "$model" --print --max-turns "$max_turns"
-               --allowedTools "$allowed_tools")
+    local cmd=(claude --model "$model" --print --output-format json
+               --max-turns "$max_turns" --allowedTools "$allowed_tools")
     [[ -n "$effort" ]] && cmd+=(--effort "$effort")
 
-    "${cmd[@]}"
+    local out_tmp err_tmp rc
+    out_tmp=$(mktemp); err_tmp=$(mktemp)
+    "${cmd[@]}" >"$out_tmp" 2>"$err_tmp"; rc=$?
+    if command -v jq >/dev/null 2>&1 && jq -e 'type=="object" and has("type")' "$out_tmp" >/dev/null 2>&1; then
+      jq -r '.result // (if (.errors|type)=="array" then (.errors|join("; ")) else (.subtype // "agent run did not return a result") end)' "$out_tmp"
+      if [ -n "${AGENT_TOKENS_FILE:-}" ]; then
+        jq -c '{input:(.usage.input_tokens // 0),output:(.usage.output_tokens // 0),cache_read:(.usage.cache_read_input_tokens // 0),cache_write:(.usage.cache_creation_input_tokens // 0)}' \
+          "$out_tmp" > "$AGENT_TOKENS_FILE" 2>/dev/null || true
+      fi
+    else
+      cat "$out_tmp"
+    fi
+    [ -s "$err_tmp" ] && cat "$err_tmp"
+    rm -f "$out_tmp" "$err_tmp"
+    return $rc
   }
 fi
 
@@ -969,6 +1021,23 @@ _write_heartbeat() {
   local instance="${AGENT_INSTANCE:-0}"
   mkdir -p "$SIGNAL_DIR/heartbeats"
   date -u +%s > "$SIGNAL_DIR/heartbeats/${role}_${instance}.heartbeat"
+}
+
+# Keep the heartbeat fresh during a long-running agent invocation. A single
+# coding-agent call routinely exceeds the supervisor's stale threshold
+# (3× heartbeat_interval, 90s by default); without this, a busy agent looks
+# "stuck" and gets killed and restarted mid-work. The pinger runs in the
+# background and refreshes the heartbeat on a short interval.
+HEARTBEAT_PINGER_PID=""
+_start_heartbeat_pinger() {
+  [ -n "${HEARTBEAT_PINGER_PID:-}" ] && return 0
+  ( while true; do _write_heartbeat; sleep "${HEARTBEAT_PING_INTERVAL:-15}"; done ) &
+  HEARTBEAT_PINGER_PID=$!
+}
+_stop_heartbeat_pinger() {
+  [ -n "${HEARTBEAT_PINGER_PID:-}" ] || return 0
+  { kill "$HEARTBEAT_PINGER_PID" 2>/dev/null; wait "$HEARTBEAT_PINGER_PID"; } 2>/dev/null || true
+  HEARTBEAT_PINGER_PID=""
 }
 
 # ── Usage-limit resilience ───────────────────────────────────────────────────
@@ -1096,9 +1165,27 @@ invoke_agent_logged() {
   local response_tmp exit_code=0
   response_tmp=$(mktemp)
 
+  # Sidecar for exact token usage. Providers that know their token counts (e.g.
+  # providers/claude.sh via --output-format json) write a JSON object here; we
+  # prefer it over scraping stdout. Exported so the provider subshell sees it.
+  local tokens_file
+  tokens_file=$(mktemp)
+  export AGENT_TOKENS_FILE="$tokens_file"
+
+  # Keep the heartbeat fresh for the whole (possibly multi-minute) invocation so
+  # the supervisor doesn't kill a busy agent as "stuck". If a lifetime pinger is
+  # already running (started by run_agent.sh) we leave it be; otherwise we start
+  # one here (for direct/independent callers) and stop it when done.
+  local _own_pinger=false
+  if [ -z "${HEARTBEAT_PINGER_PID:-}" ]; then
+    _start_heartbeat_pinger
+    _own_pinger=true
+  fi
+
   local total_waited=0
   while true; do
     : > "$response_tmp"
+    : > "$tokens_file"
     # Temporarily disable pipefail so we can capture PIPESTATUS through tee
     set +eo pipefail
     invoke_coding_agent < "$prompt_file" | tee "$response_tmp"
@@ -1132,13 +1219,23 @@ invoke_agent_logged() {
     break
   done
 
+  [ "$_own_pinger" = true ] && _stop_heartbeat_pinger
+
   local end_ts duration_seconds
   end_ts=$(date -u +%s)
   duration_seconds=$(( end_ts - start_ts ))
 
-  # Parse tokens from response
+  # Token usage: prefer the provider's exact sidecar counts; otherwise scrape
+  # the response text. (Recorded even in minimal mode — it's cheap and Racetrack
+  # relies on it for per-agent token totals.)
   local tokens_json="null"
-  [ "$LOG_LEVEL" != "minimal" ] && tokens_json=$(parse_tokens "$response_tmp")
+  if [ -s "$tokens_file" ]; then
+    tokens_json=$(tr -d '\n' < "$tokens_file")
+  elif [ "$LOG_LEVEL" != "minimal" ]; then
+    tokens_json=$(parse_tokens "$response_tmp")
+  fi
+  rm -f "$tokens_file"
+  unset AGENT_TOKENS_FILE
 
   # Response summary + optional full capture
   local response_summary="" response_file=""
@@ -1358,12 +1455,18 @@ lifecycle_implementer() {
       echo "$TASK_CONTENT"
     } > "$prompt_tmp"
 
+    local PRE_STATUS
+    PRE_STATUS=$(task_status "$TASK_ID")
+
     local EXIT_CODE=0
     invoke_agent_logged "$prompt_tmp" "$TASK_ID" "$MODE" || EXIT_CODE=$?
     rm -f "$prompt_tmp"
 
     # Post-invoke hook (non-fatal)
     run_hooks "post_invoke" "$TASK_ID" "$WORKTREE" || true
+
+    # If the agent advanced the status only in the task file, sync the table.
+    reconcile_status_from_taskfile "$TASK_ID" "$PRE_STATUS"
 
     local CURRENT_STATUS
     CURRENT_STATUS=$(task_status "$TASK_ID")
@@ -1505,10 +1608,16 @@ lifecycle_reviewer() {
       echo '```'
     } > "$prompt_tmp"
 
+    local PRE_STATUS
+    PRE_STATUS=$(task_status "$TASK_ID")   # "In Review" going in
+
     invoke_agent_logged "$prompt_tmp" "$TASK_ID" "review" || true
     rm -f "$prompt_tmp"
 
     run_hooks "post_invoke" "$TASK_ID" "$WORKTREE" || true
+
+    # If the reviewer recorded its verdict only in the task file, sync the table.
+    reconcile_status_from_taskfile "$TASK_ID" "$PRE_STATUS"
 
     local NEW_STATUS
     NEW_STATUS=$(task_status "$TASK_ID")
@@ -1623,10 +1732,13 @@ lifecycle_qa_responder() {
 
 _cleanup() {
   trap - SIGINT SIGTERM        # disarm so a second signal can't re-enter
-  log_info "Caught interrupt, shutting down..."
+  local who="${AGENT_ROLE:-agent}_${AGENT_INSTANCE:-0}"
+  log_info "[$who] Caught termination signal, shutting down..."
   # Terminate any in-flight child (e.g. a running coding-agent invocation) so it
-  # doesn't outlive this agent as an orphan. Harmless if there are none.
-  pkill -P $$ 2>/dev/null || true
+  # doesn't outlive this agent as an orphan, then reap it in the same step so it
+  # leaves no zombie and bash prints no raw "Terminated" line. Harmless if there
+  # are no children.
+  { pkill -P $$ 2>/dev/null; wait; } 2>/dev/null || true
   exit 0
 }
 trap _cleanup SIGINT SIGTERM

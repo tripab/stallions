@@ -7,17 +7,39 @@
 
 set -euo pipefail
 
-# Enable job control so every backgrounded agent becomes the leader of its own
-# process group. This gives the supervisor two things on shutdown:
-#   1. Ctrl-C (SIGINT to the foreground group) reaches ONLY the supervisor, not
-#      the agents — so the supervisor is the sole, orderly signal handler.
-#   2. `kill -<sig> -<pid>` signals the agent AND its descendants (e.g. an
-#      in-flight coding-agent invocation) as one group, so nothing is orphaned.
-# Job-control notifications ("[1] Done") are not printed for non-interactive
-# scripts, so this adds no output noise.
-set -m
-
 source "$(dirname "$0")/common.sh"
+
+# Each agent is launched into its own process group (see _spawn_in_pgroup) so:
+#   1. The terminal's Ctrl-C (SIGINT → foreground process group) reaches ONLY
+#      the supervisor, which becomes the sole, orderly shutdown handler. (Note:
+#      we deliberately do NOT use `set -m` here — job control would run the
+#      monitor's foreground `sleep` in its own group and let Ctrl-C bypass the
+#      supervisor's trap entirely.)
+#   2. `kill -<sig> -<pid>` signals the whole group — the agent AND its in-flight
+#      coding-agent child — so nothing is orphaned.
+#
+# perl/python3 set the new process group and then `exec` the agent, so the PID
+# is preserved and `$!` is the new group leader. They also reset SIGINT to its
+# default disposition before exec: a shell backgrounds async commands (`&`) with
+# SIGINT set to IGNORE, and a non-interactive shell cannot trap a signal that was
+# ignored on entry — so without this reset the agents would ignore the shutdown
+# SIGINT entirely. Falls back to a plain spawn (agents share the supervisor's
+# group and SIG_IGN; shutdown then relies on SIGTERM + cooperative cleanup).
+_PGROUP_LAUNCHER=""
+if command -v perl >/dev/null 2>&1; then
+  _PGROUP_LAUNCHER="perl"
+elif command -v python3 >/dev/null 2>&1; then
+  _PGROUP_LAUNCHER="python3"
+fi
+
+# Spawn "$@" in a background process of its own process group. Caller reads $!.
+_spawn_in_pgroup() {
+  case "$_PGROUP_LAUNCHER" in
+    perl)    perl -e 'setpgrp(0,0); $SIG{INT}="DEFAULT"; exec @ARGV or die' "$@" & ;;
+    python3) python3 -c 'import os,sys,signal; os.setsid(); signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' "$@" & ;;
+    *)       "$@" & ;;
+  esac
+}
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 
@@ -54,6 +76,7 @@ AGENT_RESTART=()     # consecutive restart count per agent
 AGENT_ROLES=()       # role name (for re-spawn)
 AGENT_INSTANCES=()   # instance number (for re-spawn)
 ACTIVE_AGENTS=0      # count of non-tombstoned agents
+SHUTTING_DOWN=0      # re-entrancy guard for _shutdown
 
 # Find the array index for a given agent key. Prints the index, or -1 if absent.
 # Usage: _agent_index <key>
@@ -77,7 +100,7 @@ spawn_agent() {
   local key="${role}_${instance}"
 
   log_info "Spawning agent: role=$role instance=$instance"
-  bash "$RUN_AGENT" --role "$role" --instance "$instance" &
+  _spawn_in_pgroup bash "$RUN_AGENT" --role "$role" --instance "$instance"
   local pid=$!
 
   local idx
@@ -149,61 +172,77 @@ _signal_group() {
   kill "-${sig}" "-${pid}" 2>/dev/null || kill "-${sig}" "$pid" 2>/dev/null || true
 }
 
-_shutdown() {
-  echo ""
-  log_info "Supervisor caught SIGINT/SIGTERM — initiating graceful shutdown..."
+# Terminate a single agent's process group and reap its leader. SIGTERM first,
+# then SIGKILL after a short grace (via a background timer so the wait stays
+# responsive). Pairing the kill with an immediate combined wait reaps the child
+# (no zombie) and keeps bash from printing raw "Terminated" job notifications.
+# Usage: _terminate_agent <pid>
+_terminate_agent() {
+  local pid="$1"
+  kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return; }
+  ( sleep "${SHUTDOWN_GRACE:-10}"; _signal_group KILL "$pid" ) &
+  local k=$!
+  # SIGINT (not SIGTERM): the agent traps it and bash stays quiet even when the
+  # agent is blocked in a foreground coding-agent call. SIGKILL escalation above.
+  { _signal_group INT "$pid"; wait "$pid"; } 2>/dev/null || true
+  { kill "$k" 2>/dev/null; wait "$k"; } 2>/dev/null || true
+}
 
-  # SIGTERM each live agent's process group (agent + any coding-agent child).
-  local pids_to_kill=()
-  local i
+_shutdown() {
+  # Re-entrancy guard + disarm so a second Ctrl-C can't spawn a competing
+  # shutdown path; there is exactly one orderly teardown.
+  (( SHUTTING_DOWN )) && return
+  SHUTTING_DOWN=1
+  trap - SIGINT SIGTERM SIGHUP
+
+  echo ""
+  log_info "Supervisor caught shutdown signal — stopping all agents..."
+
+  # Collect live agent leader PIDs (each leads its own process group).
+  local pids=() i
   for i in "${!AGENT_KEYS[@]}"; do
     local key="${AGENT_KEYS[$i]}"
     [ -z "$key" ] && continue          # skip tombstoned slots
     local pid="${AGENT_PIDS[$i]}"
     if kill -0 "$pid" 2>/dev/null; then
-      pids_to_kill+=("$pid")
-      log_info "Sending SIGTERM to $key (PID $pid) and its children..."
-      _signal_group TERM "$pid"
+      pids+=("$pid")
+      log_info "  → stopping $key (PID $pid)"
     fi
   done
 
-  if [ "${#pids_to_kill[@]}" -eq 0 ]; then
-    log_ok "Supervisor shutdown complete. No agents were running."
+  if [ "${#pids[@]}" -eq 0 ]; then
+    log_ok "Shutdown complete — no agents were running."
     exit 0
   fi
 
-  # Wait up to 10s for graceful exit, checking every second.
-  log_info "Waiting up to 10s for ${#pids_to_kill[@]} agent(s) to exit..."
-  local deadline=$(( $(date +%s) + 10 ))
-  local pid
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    local still_alive=false
-    for pid in "${pids_to_kill[@]}"; do
-      kill -0 "$pid" 2>/dev/null && still_alive=true
-    done
-    [ "$still_alive" = false ] && break
-    sleep 1
-  done
+  # Escalation timer: SIGKILL any process group still alive after the grace
+  # period. Runs in the background so the await below stays responsive.
+  local grace="${SHUTDOWN_GRACE:-10}" p
+  ( sleep "$grace"; for p in "${pids[@]}"; do _signal_group KILL "$p"; done ) &
+  local killer=$!
 
-  # SIGKILL any process group that ignored SIGTERM.
-  for pid in "${pids_to_kill[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-      log_err "PID $pid did not exit — sending SIGKILL to its process group."
-      _signal_group KILL "$pid"
-    fi
-  done
+  log_info "Sent stop signal to ${#pids[@]} agent process group(s); waiting up to ${grace}s for clean exit..."
 
-  # Reap the children so none linger as zombies and the wait actually blocks
-  # until each has truly terminated.
-  for pid in "${pids_to_kill[@]}"; do
-    wait "$pid" 2>/dev/null || true
-  done
+  # awaitTermination. Signal every group first (parallel, so a slow agent does
+  # not delay the others), then a single combined wait blocks until all are
+  # reaped — no zombies. We use SIGINT (not SIGTERM): an agent is usually blocked
+  # in a foreground coding-agent call, and bash announces a foreground child
+  # killed by SIGTERM ("Terminated: 15") but stays silent for SIGINT — which the
+  # agent traps and the coding-agent treats as a cancel, exiting cleanly.
+  {
+    for p in "${pids[@]}"; do _signal_group INT "$p"; done
+    wait "${pids[@]}"
+  } 2>/dev/null || true
 
-  log_ok "Supervisor shutdown complete. All agents stopped."
+  # All agents gone — cancel the escalation timer (grouped kill+wait so bash
+  # prints no "Terminated" line for the cancelled timer).
+  { kill "$killer" 2>/dev/null; wait "$killer"; } 2>/dev/null || true
+
+  log_ok "Shutdown complete — all ${#pids[@]} agent(s) stopped."
   exit 0
 }
 
-trap _shutdown SIGINT SIGTERM
+trap _shutdown SIGINT SIGTERM SIGHUP
 
 # ── Heartbeat monitoring + re-spawn loop ─────────────────────────────────────
 
@@ -254,6 +293,12 @@ monitor_loop() {
         reason="heartbeat stale (${hb_age}s ago, threshold ${stale_threshold}s)"
       fi
 
+      # Terminate the old process group (a stuck agent is still alive, with a
+      # possible coding-agent child) and reap the leader so it leaves no zombie
+      # and bash prints no raw "Terminated" line. Done for both the restart and
+      # the escalation paths below.
+      _terminate_agent "$pid"
+
       if [ "$restart_count" -ge "$MAX_RESTART_COUNT" ]; then
         log_err "$key has exceeded max restarts ($MAX_RESTART_COUNT). Escalating."
         _record_escalation "$key" "$reason"
@@ -266,16 +311,6 @@ monitor_loop() {
       fi
 
       log_err "$key failed: $reason (restart $((restart_count+1))/$MAX_RESTART_COUNT)"
-
-      # If the old process is still alive (stuck, not exited), terminate its
-      # whole group first so it and any child coding-agent don't linger as
-      # orphans alongside the replacement we're about to spawn.
-      if kill -0 "$pid" 2>/dev/null; then
-        _signal_group TERM "$pid"
-        sleep 2
-        kill -0 "$pid" 2>/dev/null && _signal_group KILL "$pid"
-      fi
-
       log_info "Waiting ${RESTART_BACKOFF}s before re-spawning $key..."
       sleep "$RESTART_BACKOFF"
 

@@ -338,7 +338,7 @@ The supervisor is the only new long-running process. It replaces the "open N ter
 
 1. **Spawn agents**: Read config → for each role with `instances > 0` and `type != interactive`, spawn `run_agent.sh --role <n>` as a background process.
 
-2. **Health monitoring**: Each agent writes a heartbeat file every loop iteration. The supervisor checks these every `heartbeat_interval` seconds. If a heartbeat is stale (age > 3× expected cycle time), the agent is considered stuck.
+2. **Health monitoring**: Each agent runs a background *heartbeat pinger* that refreshes its heartbeat file on a short interval for the agent's whole lifetime — including during multi-minute coding-agent invocations and idle poll sleeps. The supervisor checks heartbeats every `heartbeat_interval` seconds and treats an agent as stuck only when the heartbeat is stale (age > 3× interval) *and* its process is wedged — so a merely busy or waiting agent is never killed and restarted mid-work. A dead process is still caught directly via its PID.
 
 3. **Re-spawn on failure**: If an agent process exits or is stuck, the supervisor kills it (if still running), waits `restart_backoff` seconds, and re-launches. After `max_restart_count` consecutive failures, it stops trying and notifies the user.
 
@@ -482,7 +482,9 @@ The `v` field lets the dashboard and any future tooling handle schema changes gr
 
 ### 6.2 Token Parsing
 
-Token counts are extracted from the coding agent's stdout. Different providers report tokens differently — Claude Code prints a summary line, Codex has its own format, others may not report at all. A `parse_tokens()` function in `common.sh` uses `grep`/`sed` pipelines with fallback patterns. When parsing fails, `tokens` is set to `null`.
+Exact token counts come from the provider when it can supply them. The Claude Code provider runs with `--output-format json` and writes the precise `input`/`output`/`cache_read`/`cache_write` counts (from the result envelope's `.usage`) to a sidecar file (`$AGENT_TOKENS_FILE`) that the runner reads straight into the JSONL log — this is what Racetrack uses for per-agent token totals, so it shows real usage rather than falling back to counting invocations. The readable assistant text (`.result`, or the error list on an `error_max_turns` envelope) is still emitted to stdout for the response summary and usage-limit detection.
+
+For providers that don't expose a sidecar, `parse_tokens()` in `common.sh` falls back to scraping the agent's stdout with `grep`/`sed` patterns; when that also fails, `tokens` is set to `null`.
 
 ### 6.3 Response Capture
 
@@ -646,6 +648,9 @@ EOF
 | `phase_merged` | `common.sh`, `ensure_phases_merged()` on success | green `#36a64f` |
 | `agent_failed` | `supervisor.sh`, after max restart count hit | red `#dc3545` |
 | `all_tasks_done` | `supervisor.sh`, when all tasks = Done | green `#36a64f` |
+| `usage_limit_paused` | `common.sh`, `invoke_agent_logged()` on a detected 5h/weekly/session cap | yellow `#daa520` |
+| `usage_limit_resumed` | `common.sh`, `invoke_agent_logged()` when the session renews | green `#36a64f` |
+| `usage_limit_giveup` | `common.sh`, `invoke_agent_logged()` after `max_wait` exceeded | red `#dc3545` |
 
 All hook points call `notify_external()`, which dispatches to `notify_slack()` and can be extended to support Discord, Teams, etc.
 

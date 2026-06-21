@@ -289,6 +289,9 @@ Every meaningful agent event fires through `notify_external()` — a single call
 | `phase_merge_needed` | `ensure_phases_merged` | Merge conflict — manual resolution needed |
 | `agent_failed` | `supervisor.sh` | Agent exceeded max restarts |
 | `all_tasks_done` | `supervisor.sh` | All agents completed |
+| `usage_limit_paused` | `invoke_agent_logged` | Agent paused on a 5h/weekly/session cap |
+| `usage_limit_resumed` | `invoke_agent_logged` | Session renewed; agent resumed |
+| `usage_limit_giveup` | `invoke_agent_logged` | Gave up after `max_wait` on a cap |
 
 Desktop notifications use `osascript` (macOS) or `notify-send` (Linux). Slack is optional — see [Slack Setup](#slack-setup) below.
 
